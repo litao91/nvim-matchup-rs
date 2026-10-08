@@ -1,0 +1,21 @@
+[package]
+name = "nvim-matchup-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust rewrite of vim-matchup's classic delimiter-matching engine for Neovim, built on nvim-oxi"
+license = "MIT"
+
+[lib]
+name = "matchup_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nvim-oxi = { version = "0.6.0", features = ["neovim-0-11"] }
+fancy-regex = "0.16"
+regex = "1"
+once_cell = "1"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1

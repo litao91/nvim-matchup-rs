@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Compiled plugin artifacts (rebuilt from source)
+/lua/*.so
+/lua/*.dll
+/lua/*.dylib
+
+# Benchmark generated files
+/bench/files/
+
+# Editor/OS noise
+*.swp
+.DS_Store
