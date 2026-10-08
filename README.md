@@ -45,14 +45,26 @@ Neovim 0.13.0-dev; note that this nvim version changed some C API signatures
 callbacks, so the plugin drives those paths through `eval`/command strings and
 vimscript shims in `autoload/matchup/rs.vim`.
 
-```sh
-./build.sh            # cargo build --release, then copy to lua/matchup_rs.so
+Build the native module from inside nvim with the Lua helper:
+
+```vim
+:lua require('matchup_rs.build').build()
 ```
 
-`build.sh` picks the right artifact per platform (`libmatchup_rs.so` on Linux,
-`libmatchup_rs.dylib` on macOS, `matchup_rs.dll` on Windows) and copies it to
-`lua/matchup_rs.so` (`.dll` on Windows), which is where `require('matchup_rs')`
-finds it. Equivalent manual steps:
+or headlessly:
+
+```sh
+nvim --headless "+lua require('matchup_rs.build').build()" +qa
+```
+
+`build()` runs `cargo build --release` (via `--manifest-path`/`--target-dir`, so
+your working directory is untouched), picks the right artifact per platform
+(`libmatchup_rs.so` on Linux, `libmatchup_rs.dylib` on macOS, `matchup_rs.dll`
+on Windows), and atomically copies it to `lua/matchup_rs.so` (`.dll` on Windows)
+where `require('matchup_rs')` finds it. Options:
+`build({ profile = 'debug' })`, `build({ dir = '<repo root>' })`, and
+`build({ touch = true })` (touch `src/*.rs` first - a stale-mtime workaround on
+WSL2/drvfs). It needs a Rust toolchain on `PATH`. Equivalent manual steps:
 
 ```sh
 cargo build --release
@@ -187,8 +199,8 @@ src/
   motion.rs      %, g%, [%, ]%, z% + operator-pending machinery
   textobj.rs     i%, a%
   lib.rs         Lua module surface (setup, raw engine API, autocmd/keymap wiring)
-build.sh                     cargo build --release + deploy to lua/matchup_rs.so
-plugin/matchup_rs.vim        load guards only (plugin is inert until setup)
+lua/matchup_rs/build.lua     Lua build helper: require('matchup_rs.build').build()
+plugin/matchup_rs.lua        load guard only (plugin is inert until setup)
 autoload/matchup/rs.vim      activation (hl groups/commands/matchit), timers, skip eval, op re-feed
 autoload/matchup/util.vim    compat helpers for user ftplugins (matchpref bridges to Rust)
 after/queries/               treesitter queries, copied from vim-matchup (MIT)
