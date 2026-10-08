@@ -148,6 +148,7 @@ pub struct GOpts {
     pub ts_stopline: usize,
     pub ts_enable_quotes: bool,
     pub ts_include_match_words: bool,
+    pub ts_disable_virtual_text: bool,
 }
 
 fn gvar_i64(name: &str, default: i64) -> i64 {
@@ -218,6 +219,7 @@ impl GOpts {
             ts_stopline: gvar_i64("matchup_treesitter_stopline", 400).max(0) as usize,
             ts_enable_quotes: gvar_bool("matchup_treesitter_enable_quotes", 1) != 0,
             ts_include_match_words: gvar_bool("matchup_treesitter_include_match_words", 0) != 0,
+            ts_disable_virtual_text: gvar_bool("matchup_treesitter_disable_virtual_text", 0) != 0,
         }
     }
 }
@@ -379,6 +381,13 @@ impl State {
         self.expr_cache.borrow_mut().clear();
         self.surround_memo.borrow_mut().clear();
         crate::treesitter::invalidate(self, None);
+    }
+
+    /// Drop all per-buffer caches (BufDelete/BufWipeout).
+    pub fn drop_buf(&self, bufnr: i32) {
+        self.bufs.borrow_mut().remove(&bufnr);
+        self.surround_memo.borrow_mut().remove(&bufnr);
+        crate::treesitter::invalidate(self, Some(bufnr));
     }
 
     /// Translate + compile with the shared cache.

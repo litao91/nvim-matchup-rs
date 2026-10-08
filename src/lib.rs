@@ -290,6 +290,12 @@ fn matchup_rs() -> Result<Dictionary> {
     });
 
     let s = Rc::clone(&state);
+    let drop_buf: Function<(i64,), ()> = Function::from_fn(move |(b,): (i64,)| -> nvim_oxi::Result<()> {
+        s.drop_buf(b as i32);
+        Ok(())
+    });
+
+    let s = Rc::clone(&state);
     let show_times: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
         let times = s.perf.times.borrow().clone();
         let mut keys: Vec<&String> = times.keys().collect();
@@ -472,6 +478,7 @@ fn matchup_rs() -> Result<Dictionary> {
         ("update", Object::from(update)),
         ("clear", Object::from(clear)),
         ("reload", Object::from(reload)),
+        ("drop_buf", Object::from(drop_buf)),
         ("show_times", Object::from(show_times)),
         ("timer_callback", Object::from(timer_callback)),
         ("fade_timer_callback", Object::from(fade_timer_callback)),

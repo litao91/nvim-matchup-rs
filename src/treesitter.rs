@@ -1116,6 +1116,8 @@ pub fn invalidate(state: &State, bufnr: Option<i32>) {
             ts.verdicts.clear();
             ts.delim_cache.clear();
             ts.cache_order.clear();
+            ts.queries.clear();
+            ts.query_failed.clear();
         }
     }
 }

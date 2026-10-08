@@ -141,7 +141,8 @@ command! MatchupShowTimes call luaeval("require('matchup_rs').show_times()")
 
 " offscreen statusline helper (compat with vim-matchup)
 function! MatchupStatusOffscreen() abort
-  return get(w:, 'matchup_statusline', '')
+  return substitute(get(w:, 'matchup_statusline', ''),
+        \ '%<\|%#\w*#', '', 'g')
 endfunction
 
 " ---------------------------------------------------------------------------

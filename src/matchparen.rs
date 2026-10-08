@@ -129,6 +129,11 @@ pub fn setup(state: &SharedState) {
         "lua require('matchup_rs').clear()",
         None,
     );
+    ac(
+        &["BufDelete", "BufWipeout"],
+        "lua require('matchup_rs').drop_buf(tonumber(vim.fn.expand('<abuf>')) or 0)",
+        None,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +608,7 @@ pub fn add_matches(ctx: &Ctx, ml: &MatchingList, current: Option<&Delim>) {
 
     let mut buf = ctx.buf.clone();
     for corr in &ml.delims {
-        if corr.match_.is_empty() {
+        if corr.match_.is_empty() && !ctx.gopts.ts_disable_virtual_text {
             // empty-match sentinel: render as virtual text like the
             // treesitter scope-end marker (matchparen.vim:1210-1221).
             let open_match = ml.delims.first().map(|d| d.match_.as_str()).unwrap_or("");
