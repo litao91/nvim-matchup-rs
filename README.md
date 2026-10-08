@@ -34,7 +34,7 @@ Both of vim-matchup's matching engines are implemented natively in Rust:
 | text objects `i%`, `a%` (visual + operator-pending, linewise operators, html quirks) | done |
 | `b:match_skip` (`s:`/`S:`/`r:`/`R:` and raw expressions), `b:match_words` (backrefs, augments, `\zs`, hlend, midmap) | done |
 | treesitter engine (parsers via `libloading`, incremental parsing, scope/open/mid/close model, scope-end virtual text) | done |
-| `g:matchup_*` option compatibility, `after/ftplugin` patches, commands (`NoMatchParen`, `DoMatchParen`, `MatchupReload`, `MatchupShowTimes`) | done |
+| `setup(opts)` configuration, native per-filetype definitions applied via `FileType` autocmd, commands (`NoMatchParen`, `DoMatchParen`, `MatchupReload`, `MatchupShowTimes`) | done |
 | offscreen `popup` method, surround, transmute, where-am-I, mouse, Vim 8 | not ported |
 
 ## Build
@@ -46,8 +46,17 @@ callbacks, so the plugin drives those paths through `eval`/command strings and
 vimscript shims in `autoload/matchup/rs.vim`.
 
 ```sh
+./build.sh            # cargo build --release, then copy to lua/matchup_rs.so
+```
+
+`build.sh` picks the right artifact per platform (`libmatchup_rs.so` on Linux,
+`libmatchup_rs.dylib` on macOS, `matchup_rs.dll` on Windows) and copies it to
+`lua/matchup_rs.so` (`.dll` on Windows), which is where `require('matchup_rs')`
+finds it. Equivalent manual steps:
+
+```sh
 cargo build --release
-cp target/release/libmatchup_rs.so lua/matchup_rs.so   # linux; .dll/.dylib elsewhere
+cp target/release/libmatchup_rs.so lua/matchup_rs.so   # .dylib on macOS, .dll on Windows
 ```
 
 Add the repository to your `runtimepath` (e.g. your plugin manager). The
@@ -57,16 +66,52 @@ directories; the `after/queries/*/matchup.scm` files ship with the plugin.
 
 ## Usage
 
-The plugin claims `%`, `g%`, `[%`, `]%`, `z%` (normal/visual/operator-pending)
-and `i%`/`a%` (visual/operator-pending), and installs the same `<Plug>` maps
-as vim-matchup. It disables `matchit` and `pi_paren` on load, and claims
-`g:loaded_matchup` so vim-matchup's engine-agnostic `after/ftplugin` files
-work unchanged (if both plugins are on the runtimepath, whichever loads first
-wins).
+Add the repository to your `runtimepath`. The plugin is **inert until you call
+`setup`** - putting it on the runtimepath only makes `require('matchup_rs')`
+available; nothing is mapped, highlighted or configured until you call:
 
-Options are vim-matchup-compatible (`g:matchup_matchparen_*`,
-`g:matchup_delim_*`, `g:matchup_motion_*`, `g:matchup_text_obj_*`,
-`g:matchup_treesitter_*`, ...).
+```lua
+require('matchup_rs').setup({
+  -- every key is optional; omitted keys use these defaults
+  mappings = true,                       -- master switch for all keymaps
+  matchpref = {},                        -- e.g. { html = { nolists = true } }
+  delim = {
+    noskips = 0, nomids = false, stopline = 1500, count_fail = false, count_max = 8,
+  },
+  matchparen = {
+    enable = true, stopline = 400, timeout = 300, insert_timeout = 60,
+    singleton = false, pumvisible = true, nomode = '', hi_background = false,
+    offscreen = { method = 'status' },   -- or `false` to disable offscreen
+    start_sign = '▶', end_sign = '◀',
+    deferred = false, deferred_show_delay = 50, deferred_hide_delay = 700,
+    deferred_fade_time = 0,
+  },
+  motion   = { enable = true, cursor_end = true, override_Npercent = 6, keepjumps = false },
+  text_obj = { enable = true, linewise_operators = { 'd', 'y' } },
+  treesitter = {
+    enable = true,                       -- default follows has('nvim-0.11.2')
+    disabled = {}, stopline = 400, enable_quotes = true,
+    include_match_words = false, disable_virtual_text = false,
+  },
+})
+```
+
+`setup()` claims `%`, `g%`, `[%`, `]%`, `z%` (normal/visual/operator-pending)
+and `i%`/`a%` (visual/operator-pending), installs the `<Plug>(matchup-*)` maps,
+defines the `MatchParenCur`/`MatchWord`/`MatchBackground` highlight groups and
+the `NoMatchParen`/`DoMatchParen`/`MatchupReload`/`MatchupShowTimes` commands,
+and neutralizes `matchit`/`pi_paren`. It is re-runnable, so calling it again
+reconfigures. There are **no `g:matchup_*` option globals** - configuration
+lives entirely in the `setup` table. Option names mirror vim-matchup's
+`g:matchup_<group>_<name>`, nested and de-prefixed (e.g.
+`g:matchup_treesitter_disable_virtual_text` -> `treesitter.disable_virtual_text`).
+
+Per-filetype delimiter definitions (`b:match_words`, `b:match_skip`,
+`b:match_midmap`, ...) are built into the Rust module (`src/ftplugin.rs`, a port
+of vim-matchup's `after/ftplugin/*.vim`) and applied from a `FileType` autocmd,
+so no vimscript ftplugin files are shipped. Buffer-local `b:*` variables remain
+the per-buffer configuration surface (they are set by the native ftplugin
+definitions and may be overridden by users/ftplugins as in vim-matchup).
 
 ## Performance
 
@@ -119,6 +164,13 @@ Also: `cargo test` covers the regex translator, capture-group scanner,
 `match_words` parser (backrefs, group renumbering, augments), `&iskeyword`
 class builder, skip compilation and position helpers.
 
+The native filetype definitions (`src/ftplugin.rs`) are verified byte-for-byte
+against vim-matchup's `after/ftplugin/*.vim`: a headless harness sets each of
+the 16 supported filetypes under both plugins and diffs the resulting
+`b:match_words`/`b:match_skip`/`b:match_midmap`/`&matchpairs`, both with default
+prefs and with the `matchpref` branches (`nolists`/`tagnameonly`/`template`/
+`relax_env`) enabled - all 16 match exactly in both modes.
+
 ## Layout
 
 ```
@@ -126,20 +178,22 @@ src/
   vimregex.rs    vim-magic -> fancy-regex translator (obligations, scan mode,
                  first-byte/literal-prefix analysis)
   words.rs       b:match_words/&matchpairs parser (loader.vim port)
-  state.rs       per-buffer compiled state, caches, options, perf timers
+  state.rs       per-buffer compiled state, caches, setup(opts) config, perf
   skip.rs        b:match_skip evaluation
   engine.rs      get_delim / get_matching / get_surrounding / jump_target
   treesitter.rs  pure-Rust treesitter engine
+  ftplugin.rs    native per-filetype definitions (after/ftplugin port), FileType autocmd
   matchparen.rs  highlighting, offscreen status, deferred debounce
   motion.rs      %, g%, [%, ]%, z% + operator-pending machinery
   textobj.rs     i%, a%
-plugin/matchup_rs.vim      defaults, commands, <Plug> maps, setup
-autoload/matchup/rs.vim    vimscript shims (timers, skip eval, op re-feed)
-autoload/matchup/util.vim  compat subset for the copied ftplugins
-after/ftplugin/            copied from vim-matchup (MIT)
-after/queries/             copied from vim-matchup (MIT)
-tests/diff/                cross-engine correctness harness
-bench/                     benchmark harness + results
+  lib.rs         Lua module surface (setup, raw engine API, autocmd/keymap wiring)
+build.sh                     cargo build --release + deploy to lua/matchup_rs.so
+plugin/matchup_rs.vim        load guards only (plugin is inert until setup)
+autoload/matchup/rs.vim      activation (hl groups/commands/matchit), timers, skip eval, op re-feed
+autoload/matchup/util.vim    compat helpers for user ftplugins (matchpref bridges to Rust)
+after/queries/               treesitter queries, copied from vim-matchup (MIT)
+tests/diff/                  cross-engine correctness harness
+bench/                       benchmark harness + results
 ```
 
 ## Security notes
@@ -165,5 +219,6 @@ through single-quoted vimscript literals.
 
 ## License
 
-MIT. `after/ftplugin/` and `after/queries/` are copied verbatim from
-vim-matchup (MIT, (c) Andy Massimino).
+MIT. `after/queries/` is copied verbatim from vim-matchup (MIT, (c) Andy
+Massimino); `src/ftplugin.rs` is a port of vim-matchup's `after/ftplugin/*.vim`
+delimiter definitions.

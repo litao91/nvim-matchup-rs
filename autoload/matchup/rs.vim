@@ -97,9 +97,64 @@ function! matchup#rs#text_obj_undo(seq) abort
   endif
 endfunction
 
+" One-time activation, invoked from the Rust setup(): claims the vim-matchup
+" global, defines highlight groups, neutralizes matchit/pi_paren, and
+" registers the user commands. Idempotent across repeated setup() calls.
+function! matchup#rs#activate() abort
+  if get(s:, 'activated', 0)
+    return
+  endif
+  let s:activated = 1
+
+  " claim vim-matchup's global so the original plugin yields if both are
+  " installed (our filetype definitions are native; see src/ftplugin.rs)
+  let g:loaded_matchup = 1
+
+  " highlight groups (same defaults as vim-matchup)
+  hi def link MatchParenCur MatchParen
+  hi def link MatchWord MatchParen
+  hi def link MatchBackground ColorColumn
+
+  " disable matchit / the bundled matchit plugin (port of unmatchit.vim)
+  let g:loaded_matchit = 1
+  if exists(':MatchDebug')
+    delcommand MatchDebug
+  endif
+  silent! unmap %
+  silent! unmap [%
+  silent! unmap ]%
+  silent! unmap a%
+  silent! unmap g%
+
+  " ensure pi_paren is loaded but deactivated (as in vim-matchup)
+  try
+    runtime plugin/matchparen.vim
+    au! matchparen
+  catch /^Vim\%((\a\+)\)\=:E216/
+    unlet! g:loaded_matchparen
+    runtime plugin/matchparen.vim
+    silent! au! matchparen
+    let g:loaded_matchparen = 1
+  endtry
+
+  " commands
+  command! NoMatchParen call matchup#rs#toggle(0)
+  command! DoMatchParen call matchup#rs#toggle(1)
+  command! MatchupReload call luaeval("require('matchup_rs').reload()")
+        \ | call luaeval("require('matchup_rs').update()")
+  command! MatchupShowTimes call luaeval("require('matchup_rs').show_times()")
+endfunction
+
+" offscreen statusline helper (compat with vim-matchup)
+function! MatchupStatusOffscreen() abort
+  return substitute(get(w:, 'matchup_statusline', ''),
+        \ '%<\|%#\w*#', '', 'g')
+endfunction
+
 " :NoMatchParen / :DoMatchParen
 function! matchup#rs#toggle(val) abort
-  let g:matchup_matchparen_enabled = a:val
+  call luaeval("require('matchup_rs').set_matchparen_enabled(_A)",
+        \ a:val ? v:true : v:false)
   call luaeval("require('matchup_rs').clear()")
   if a:val
     call luaeval("require('matchup_rs').update()")

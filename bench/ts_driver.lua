@@ -23,6 +23,11 @@ vim.g.matchup_treesitter_enabled = vim.g.matchup_treesitter_enabled or true
 local api = {}
 if engine == 'rs' then
   local m = require('matchup_rs')
+  local tsv = vim.g.matchup_treesitter_enabled
+  m.setup({
+    treesitter = { enable = (tsv == true or tsv == 1) },
+    matchparen = { offscreen = false },
+  })
   api.current = function()
     local c = vim.api.nvim_win_get_cursor(0)
     return m.get_delim('current', 'both_all', { lnum = c[1], cnum = c[2] + 1 })

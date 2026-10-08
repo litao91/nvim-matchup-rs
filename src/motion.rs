@@ -782,10 +782,9 @@ fn map_rhs(mode: Mode, mode_s: &str, plug_suffix: &str, rhs: &str, default_lhs: 
     }
 }
 
-pub fn setup(_state: &SharedState) {
-    let motion_enabled: i64 = api::get_var("matchup_motion_enabled").unwrap_or(1);
-    let mappings_enabled: i64 = api::get_var("matchup_mappings_enabled").unwrap_or(1);
-    if motion_enabled == 0 || mappings_enabled == 0 {
+pub fn setup(state: &SharedState) {
+    let g = state.gopts();
+    if !g.motion_enabled || !g.mappings_enabled {
         return;
     }
 

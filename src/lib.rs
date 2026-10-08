@@ -14,6 +14,7 @@ use nvim_oxi::api::{self, Buffer, Window};
 use nvim_oxi::{Array, Dictionary, Function, Object, Result};
 
 pub mod engine;
+pub mod ftplugin;
 pub mod matchparen;
 pub mod motion;
 pub mod skip;
@@ -130,10 +131,10 @@ pub(crate) fn with_ctx_for<R>(
     win: &Window,
     f: impl FnOnce(&Ctx) -> R,
 ) -> Option<R> {
-    let gopts0 = state::GOpts::read();
-    let ts_words = if gopts0.ts_enabled {
-        match crate::treesitter::active_lang(state, &gopts0, buf.handle()) {
-            Some(_) if gopts0.ts_include_match_words => state::TsWords::Filter,
+    let gopts = state.gopts();
+    let ts_words = if gopts.ts_enabled {
+        match crate::treesitter::active_lang(state, &gopts, buf.handle()) {
+            Some(_) if gopts.ts_include_match_words => state::TsWords::Filter,
             Some(_) => state::TsWords::NoWords,
             None => state::TsWords::None,
         }
@@ -142,7 +143,6 @@ pub(crate) fn with_ctx_for<R>(
     };
     ensure_buf(state, buf, ts_words);
     let h = buf.handle();
-    let gopts = GOpts::read();
     let bufs = state.bufs.borrow();
     let bc = bufs.get(&h)?;
     let ctx = Ctx::new(state, bc, buf.clone(), win.clone(), &gopts);
@@ -295,6 +295,37 @@ fn matchup_rs() -> Result<Dictionary> {
         Ok(())
     });
 
+    // :NoMatchParen / :DoMatchParen runtime toggle (via autoload/matchup/rs.vim).
+    let s = Rc::clone(&state);
+    let set_matchparen_enabled: Function<(bool,), ()> =
+        Function::from_fn(move |(on,): (bool,)| -> nvim_oxi::Result<()> {
+            s.set_matchparen_enabled(on);
+            Ok(())
+        });
+
+    // matchup#util#matchpref bridge for the ftplugin definitions: looks up
+    // <ft>.<id> in the setup(opts) matchpref table.
+    let s = Rc::clone(&state);
+    let matchpref: Function<(String, String, bool), bool> =
+        Function::from_fn(move |(ft, id, dflt): (String, String, bool)| -> nvim_oxi::Result<bool> {
+            let g = s.gopts();
+            Ok(g
+                .matchpref
+                .get(&ft)
+                .and_then(|m| m.get(&id))
+                .copied()
+                .unwrap_or(dflt))
+        });
+
+    // FileType autocmd handler: apply the native ftplugin definition.
+    let s = Rc::clone(&state);
+    let apply_ftplugin: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+        guard("apply_ftplugin", || {
+            ftplugin::apply_current(&s);
+        });
+        Ok(())
+    });
+
     let s = Rc::clone(&state);
     let show_times: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
         let times = s.perf.times.borrow().clone();
@@ -321,10 +352,17 @@ fn matchup_rs() -> Result<Dictionary> {
     // ---- setup: autocmds, keymaps, commands ----
 
     let s = Rc::clone(&state);
-    let setup: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+    let setup: Function<(Option<Dictionary>,), ()> =
+        Function::from_fn(move |(opts,): (Option<Dictionary>,)| -> nvim_oxi::Result<()> {
         install_panic_hook();
         guard("setup", || {
             let st = Rc::clone(&s);
+            let gopts = GOpts::from_opts(&GOpts::default(), opts.as_ref());
+            st.set_gopts(gopts);
+            // One-time vimscript activation (highlight groups, matchit/pi_paren
+            // neutralization, user commands). Idempotent across re-setup.
+            let _ = api::command("call matchup#rs#activate()");
+            ftplugin::setup(&st);
             matchparen::setup(&st);
             motion::setup(&st);
             textobj::setup(&st);
@@ -479,6 +517,9 @@ fn matchup_rs() -> Result<Dictionary> {
         ("clear", Object::from(clear)),
         ("reload", Object::from(reload)),
         ("drop_buf", Object::from(drop_buf)),
+        ("set_matchparen_enabled", Object::from(set_matchparen_enabled)),
+        ("matchpref", Object::from(matchpref)),
+        ("apply_ftplugin", Object::from(apply_ftplugin)),
         ("show_times", Object::from(show_times)),
         ("timer_callback", Object::from(timer_callback)),
         ("fade_timer_callback", Object::from(fade_timer_callback)),

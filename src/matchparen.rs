@@ -10,7 +10,7 @@ use nvim_oxi::api::{self, opts::CreateAutocmdOpts, types::ExtmarkVirtTextPositio
 use nvim_oxi::{Array, Object};
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts};
-use crate::state::{State, GOpts};
+use crate::state::State;
 use crate::types::{Delim, MatchingList, Pos};
 use crate::words::{Side, SideQuery};
 
@@ -293,7 +293,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     // off-screen matches
     let method = g.matchparen_offscreen_method.clone();
     if !method.is_empty() && method != "none" && !current.skip {
-        let scrolling = offscreen_scrolling_disabled();
+        let scrolling = offscreen_scrolling_disabled(ctx);
         let win_height: i64 = api::eval("winheight(0)").unwrap_or(0);
         if !scrolling && win_height > 0 {
             do_offscreen(ctx, &ml, &current, &method);
@@ -314,10 +314,15 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     ctx.state.perf.toc("matchparen.highlight", "end");
 }
 
-/// g:matchup_matchparen_offscreen.scrolloff handling (matchparen.vim:474).
-fn offscreen_scrolling_disabled() -> bool {
+/// matchparen.offscreen.scrolloff handling (matchparen.vim:474). The config
+/// value gates the check; `&scrolloff` below is the window *option* (a
+/// different thing) used for the window-edge arithmetic.
+fn offscreen_scrolling_disabled(ctx: &Ctx) -> bool {
+    if ctx.gopts.matchparen_offscreen_scrolloff == 0 {
+        return false;
+    }
     api::eval::<i64>(
-        "get(g:matchup_matchparen_offscreen, 'scrolloff', 0) && winheight(0) > 2*&scrolloff && (line('.') == line('w$')-&scrolloff && line('$') != line('w$') || line('.') == line('w0')+&scrolloff) ? 1 : 0",
+        "winheight(0) > 2*&scrolloff && (line('.') == line('w$')-&scrolloff && line('$') != line('w$') || line('.') == line('w0')+&scrolloff) ? 1 : 0",
     )
     .unwrap_or(0)
         != 0
@@ -464,7 +469,7 @@ pub fn timer_callback(state: &SharedState, tid: i64) {
         return;
     }
 
-    let g = GOpts::read();
+    let g = state.gopts();
     let show_delay = g.matchparen_deferred_show_delay as f64;
     let hide_delay = g.matchparen_deferred_hide_delay as f64;
 
@@ -529,7 +534,7 @@ pub fn fade_timer_callback(state: &SharedState, tid: i64) {
         timer_pause(tid, true);
         return;
     }
-    let fade_time = GOpts::read().matchparen_deferred_fade_time as f64;
+    let fade_time = state.gopts().matchparen_deferred_fade_time as f64;
     let do_clear = {
         let mp = state.matchparen.borrow();
         match mp.wins.get(&win_h) {

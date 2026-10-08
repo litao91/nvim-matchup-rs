@@ -64,6 +64,14 @@ end
 local api = {}
 if engine == 'rs' then
   local m = require('matchup_rs')
+  -- setup registers the FileType autocmd that applies the native ftplugin
+  -- definitions (b:match_words etc.); the raw engine ops below don't need
+  -- highlighting, so leave matchparen off to keep the sweep lean.
+  local tsv = vim.g.matchup_treesitter_enabled
+  m.setup({
+    matchparen = { enable = false },
+    treesitter = { enable = (tsv == true or tsv == 1) },
+  })
   api.warmup = function() m.get_delim('current', 'both_all', {}) end
   api.current = function()
     local d = m.get_delim('current', 'both_all', {})

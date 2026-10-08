@@ -106,7 +106,14 @@ endfunction
 
 " }}}1
 function! matchup#util#matchpref(id, default) abort " {{{1
-  return get(get(g:matchup_matchpref, &filetype, {}), a:id, a:default)
+  " matchpref now lives in the Rust setup(opts) config (no g:matchup_matchpref
+  " global); bridge to it so user ftplugins written for vim-matchup keep working.
+  try
+    return luaeval("require('matchup_rs').matchpref(_A[1],_A[2],_A[3])",
+          \ [&filetype, a:id, a:default ? v:true : v:false])
+  catch
+    return a:default
+  endtry
 endfunction
 
 let &cpo = s:save_cpo

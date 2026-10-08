@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use fancy_regex::Regex;
 use nvim_oxi::api::{self, Buffer};
+use nvim_oxi::conversion::FromObject;
+use nvim_oxi::{Dictionary, Object};
 
 use crate::skip::{compile_skip, SkipKind};
 use crate::types::Delim;
@@ -149,78 +151,253 @@ pub struct GOpts {
     pub ts_enable_quotes: bool,
     pub ts_include_match_words: bool,
     pub ts_disable_virtual_text: bool,
+    // activation gates (previously g:matchup_{mappings,motion,text_obj}_enabled)
+    pub mappings_enabled: bool,
+    pub motion_enabled: bool,
+    pub text_obj_enabled: bool,
+    pub matchparen_offscreen_scrolloff: i64,
+    /// `g:matchup_matchpref` equivalent: filetype -> pref id -> bool.
+    pub matchpref: HashMap<String, HashMap<String, bool>>,
 }
 
-fn gvar_i64(name: &str, default: i64) -> i64 {
-    api::get_var::<i64>(name).unwrap_or(default)
-}
-
-/// Read an option that may be a vimscript Boolean (v:true/v:false) or a
-/// Number; `+` coerces both, and an unset variable falls back to default.
-fn gvar_bool(name: &str, default: i64) -> i64 {
-    api::eval::<i64>(&format!("+get(g:, {q}, {d})", q = crate::motion::vim_quote(name), d = default))
-        .unwrap_or(default)
-}
-
-fn gvar_f64(name: &str, default: f64) -> f64 {
-    if let Ok(v) = api::get_var::<f64>(name) {
-        v
-    } else {
-        gvar_i64(name, default as i64) as f64
+impl Default for GOpts {
+    fn default() -> GOpts {
+        GOpts {
+            delim_noskips: 0,
+            delim_nomids: false,
+            delim_stopline: 1500,
+            delim_count_fail: false,
+            delim_count_max: 8,
+            matchparen_enabled: true,
+            matchparen_stopline: 400,
+            matchparen_timeout: 300.0,
+            matchparen_insert_timeout: 60.0,
+            matchparen_singleton: false,
+            matchparen_offscreen_method: "status".to_string(),
+            matchparen_offscreen_scrolloff: 0,
+            matchparen_start_sign: "\u{25B6}".to_string(),
+            matchparen_end_sign: "\u{25C0}".to_string(),
+            matchparen_pumvisible: 1,
+            matchparen_nomode: String::new(),
+            matchparen_deferred: false,
+            matchparen_deferred_show_delay: 50,
+            matchparen_deferred_hide_delay: 700,
+            matchparen_deferred_fade_time: 0,
+            matchparen_hi_background: false,
+            motion_cursor_end: true,
+            motion_override_npercent: 6,
+            motion_keepjumps: false,
+            text_obj_linewise_operators: vec!["d".to_string(), "y".to_string()],
+            ts_enabled: false,
+            ts_disabled: Vec::new(),
+            ts_stopline: 400,
+            ts_enable_quotes: true,
+            ts_include_match_words: false,
+            ts_disable_virtual_text: false,
+            mappings_enabled: true,
+            motion_enabled: true,
+            text_obj_enabled: true,
+            matchpref: HashMap::new(),
+        }
     }
 }
 
-fn gvar_string(name: &str, default: &str) -> String {
-    api::get_var::<String>(name).unwrap_or_else(|_| default.to_string())
+// --- setup(opts) parsing helpers -------------------------------------------
+//
+// Configuration is supplied only through `require('matchup_rs').setup{...}`
+// (a nested Lua table). Each field is optional and layered over the defaults
+// above; there is deliberately no `g:matchup_*` fallback.
+
+fn sub(d: &Dictionary, key: &str) -> Option<Dictionary> {
+    d.get(key)
+        .and_then(|v| Dictionary::from_object(v.clone()).ok())
+}
+
+fn obj_bool(o: &Object) -> Option<bool> {
+    if let Ok(i) = i64::try_from(o.clone()) {
+        return Some(i != 0);
+    }
+    nvim_oxi::Boolean::from_object(o.clone()).ok()
+}
+
+fn obj_i64(o: &Object) -> Option<i64> {
+    i64::try_from(o.clone()).ok()
+}
+
+fn obj_f64(o: &Object) -> Option<f64> {
+    if let Ok(f) = f64::from_object(o.clone()) {
+        return Some(f);
+    }
+    i64::try_from(o.clone()).ok().map(|i| i as f64)
+}
+
+fn obj_str(o: &Object) -> Option<String> {
+    String::from_object(o.clone()).ok()
+}
+
+fn obj_strlist(o: &Object) -> Option<Vec<String>> {
+    Vec::<String>::from_object(o.clone()).ok()
+}
+
+/// True when nvim is new enough for the treesitter default (upstream gates on
+/// 0.11.2). Evaluated once per setup() call.
+fn ts_default_enabled() -> bool {
+    api::eval::<i64>("has('nvim-0.11.2')").unwrap_or(0) != 0
 }
 
 impl GOpts {
-    pub fn read() -> GOpts {
-        let linewise = api::get_var::<Vec<String>>("matchup_text_obj_linewise_operators")
-            .unwrap_or_else(|_| vec!["d".to_string(), "y".to_string()]);
-        GOpts {
-            delim_noskips: gvar_i64("matchup_delim_noskips", 0),
-            delim_nomids: gvar_i64("matchup_delim_nomids", 0) != 0,
-            delim_stopline: gvar_i64("matchup_delim_stopline", 1500).max(0) as usize,
-            delim_count_fail: gvar_i64("matchup_delim_count_fail", 0) != 0,
-            delim_count_max: gvar_i64("matchup_delim_count_max", 8).max(0) as usize,
-            matchparen_enabled: gvar_i64("matchup_matchparen_enabled", 1) != 0,
-            matchparen_stopline: gvar_i64("matchup_matchparen_stopline", 400).max(0) as usize,
-            matchparen_timeout: gvar_f64("matchup_matchparen_timeout", 300.0),
-            matchparen_insert_timeout: gvar_f64("matchup_matchparen_insert_timeout", 60.0),
-            matchparen_singleton: gvar_i64("matchup_matchparen_singleton", 0) != 0,
-            matchparen_offscreen_method: {
-                // g:matchup_matchparen_offscreen is a dict; method key
-                use nvim_oxi::conversion::FromObject;
-                api::get_var::<nvim_oxi::Dictionary>("matchup_matchparen_offscreen")
-                    .ok()
-                    .and_then(|d| {
-                        d.get("method")
-                            .and_then(|v| String::from_object(v.clone()).ok())
-                    })
-                    .unwrap_or_else(|| "status".to_string())
-            },
-            matchparen_start_sign: gvar_string("matchup_matchparen_start_sign", "\u{25B6}"),
-            matchparen_end_sign: gvar_string("matchup_matchparen_end_sign", "\u{25C0}"),
-            matchparen_pumvisible: gvar_i64("matchup_matchparen_pumvisible", 1),
-            matchparen_nomode: gvar_string("matchup_matchparen_nomode", ""),
-            matchparen_deferred: gvar_i64("matchup_matchparen_deferred", 0) != 0,
-            matchparen_deferred_show_delay: gvar_i64("matchup_matchparen_deferred_show_delay", 50),
-            matchparen_deferred_hide_delay: gvar_i64("matchup_matchparen_deferred_hide_delay", 700),
-            matchparen_deferred_fade_time: gvar_i64("matchup_matchparen_deferred_fade_time", 0),
-            matchparen_hi_background: gvar_i64("matchup_matchparen_hi_background", 0) != 0,
-            motion_cursor_end: gvar_i64("matchup_motion_cursor_end", 1) != 0,
-            motion_override_npercent: gvar_i64("matchup_motion_override_Npercent", 6),
-            motion_keepjumps: gvar_i64("matchup_motion_keepjumps", 0) != 0,
-            text_obj_linewise_operators: linewise,
-            ts_enabled: gvar_bool("matchup_treesitter_enabled", 0) != 0,
-            ts_disabled: api::get_var::<Vec<String>>("matchup_treesitter_disabled")
-                .unwrap_or_default(),
-            ts_stopline: gvar_i64("matchup_treesitter_stopline", 400).max(0) as usize,
-            ts_enable_quotes: gvar_bool("matchup_treesitter_enable_quotes", 1) != 0,
-            ts_include_match_words: gvar_bool("matchup_treesitter_include_match_words", 0) != 0,
-            ts_disable_virtual_text: gvar_bool("matchup_treesitter_disable_virtual_text", 0) != 0,
+    /// Layer the `setup(opts)` table over `base` (normally `GOpts::default()`).
+    pub fn from_opts(base: &GOpts, opts: Option<&Dictionary>) -> GOpts {
+        let mut g = base.clone();
+        let opts = match opts {
+            Some(o) => o,
+            None => return g,
+        };
+
+        if let Some(v) = opts.get("mappings").and_then(obj_bool) {
+            g.mappings_enabled = v;
         }
+
+        if let Some(mp) = sub(opts, "matchpref") {
+            for (ft, v) in mp.iter() {
+                if let Ok(inner) = Dictionary::from_object(v.clone()) {
+                    let m = g.matchpref.entry(ft.to_string()).or_default();
+                    for (id, iv) in inner.iter() {
+                        if let Some(b) = obj_bool(iv) {
+                            m.insert(id.to_string(), b);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(d) = sub(opts, "delim") {
+            if let Some(v) = d.get("noskips").and_then(obj_i64) {
+                g.delim_noskips = v;
+            }
+            if let Some(v) = d.get("nomids").and_then(obj_bool) {
+                g.delim_nomids = v;
+            }
+            if let Some(v) = d.get("stopline").and_then(obj_i64) {
+                g.delim_stopline = v.max(0) as usize;
+            }
+            if let Some(v) = d.get("count_fail").and_then(obj_bool) {
+                g.delim_count_fail = v;
+            }
+            if let Some(v) = d.get("count_max").and_then(obj_i64) {
+                g.delim_count_max = v.max(0) as usize;
+            }
+        }
+
+        if let Some(d) = sub(opts, "matchparen") {
+            if let Some(v) = d.get("enable").and_then(obj_bool) {
+                g.matchparen_enabled = v;
+            }
+            if let Some(v) = d.get("stopline").and_then(obj_i64) {
+                g.matchparen_stopline = v.max(0) as usize;
+            }
+            if let Some(v) = d.get("timeout").and_then(obj_f64) {
+                g.matchparen_timeout = v;
+            }
+            if let Some(v) = d.get("insert_timeout").and_then(obj_f64) {
+                g.matchparen_insert_timeout = v;
+            }
+            if let Some(v) = d.get("singleton").and_then(obj_bool) {
+                g.matchparen_singleton = v;
+            }
+            if let Some(v) = d.get("pumvisible").and_then(obj_bool) {
+                g.matchparen_pumvisible = v as i64;
+            }
+            if let Some(v) = d.get("nomode").and_then(obj_str) {
+                g.matchparen_nomode = v;
+            }
+            if let Some(v) = d.get("hi_background").and_then(obj_bool) {
+                g.matchparen_hi_background = v;
+            }
+            if let Some(v) = d.get("start_sign").and_then(obj_str) {
+                g.matchparen_start_sign = v;
+            }
+            if let Some(v) = d.get("end_sign").and_then(obj_str) {
+                g.matchparen_end_sign = v;
+            }
+            if let Some(v) = d.get("deferred").and_then(obj_bool) {
+                g.matchparen_deferred = v;
+            }
+            if let Some(v) = d.get("deferred_show_delay").and_then(obj_i64) {
+                g.matchparen_deferred_show_delay = v;
+            }
+            if let Some(v) = d.get("deferred_hide_delay").and_then(obj_i64) {
+                g.matchparen_deferred_hide_delay = v;
+            }
+            if let Some(v) = d.get("deferred_fade_time").and_then(obj_i64) {
+                g.matchparen_deferred_fade_time = v;
+            }
+            // offscreen: `false` disables; a table sets method/scrolloff.
+            if let Some(ov) = d.get("offscreen") {
+                if obj_bool(ov) == Some(false) {
+                    g.matchparen_offscreen_method = String::new();
+                    g.matchparen_offscreen_scrolloff = 0;
+                } else if let Ok(od) = Dictionary::from_object(ov.clone()) {
+                    // A provided table replaces the default entirely; an
+                    // absent `method` disables offscreen (as in vim-matchup).
+                    g.matchparen_offscreen_method =
+                        od.get("method").and_then(obj_str).unwrap_or_default();
+                    if let Some(s) = od.get("scrolloff").and_then(obj_i64) {
+                        g.matchparen_offscreen_scrolloff = s;
+                    }
+                }
+            }
+        }
+
+        if let Some(d) = sub(opts, "motion") {
+            if let Some(v) = d.get("enable").and_then(obj_bool) {
+                g.motion_enabled = v;
+            }
+            if let Some(v) = d.get("cursor_end").and_then(obj_bool) {
+                g.motion_cursor_end = v;
+            }
+            if let Some(v) = d.get("override_Npercent").and_then(obj_i64) {
+                g.motion_override_npercent = v;
+            }
+            if let Some(v) = d.get("keepjumps").and_then(obj_bool) {
+                g.motion_keepjumps = v;
+            }
+        }
+
+        if let Some(d) = sub(opts, "text_obj") {
+            if let Some(v) = d.get("enable").and_then(obj_bool) {
+                g.text_obj_enabled = v;
+            }
+            if let Some(v) = d.get("linewise_operators").and_then(obj_strlist) {
+                g.text_obj_linewise_operators = v;
+            }
+        }
+
+        // treesitter: default `enable` follows has('nvim-0.11.2') even when the
+        // group is omitted, so an explicit setup{} matches upstream behavior.
+        let ts_dflt = ts_default_enabled();
+        if let Some(d) = sub(opts, "treesitter") {
+            g.ts_enabled = d.get("enable").and_then(obj_bool).unwrap_or(ts_dflt);
+            if let Some(v) = d.get("disabled").and_then(obj_strlist) {
+                g.ts_disabled = v;
+            }
+            if let Some(v) = d.get("stopline").and_then(obj_i64) {
+                g.ts_stopline = v.max(0) as usize;
+            }
+            if let Some(v) = d.get("enable_quotes").and_then(obj_bool) {
+                g.ts_enable_quotes = v;
+            }
+            if let Some(v) = d.get("include_match_words").and_then(obj_bool) {
+                g.ts_include_match_words = v;
+            }
+            if let Some(v) = d.get("disable_virtual_text").and_then(obj_bool) {
+                g.ts_disable_virtual_text = v;
+            }
+        } else {
+            g.ts_enabled = ts_dflt;
+        }
+
+        g
     }
 }
 
@@ -341,6 +518,8 @@ pub struct State {
     pub matchparen: RefCell<crate::matchparen::MatchParenState>,
     pub perf: Perf,
     pub ts: RefCell<crate::treesitter::TsState>,
+    /// Configuration supplied via `require('matchup_rs').setup{...}`.
+    pub gopts: RefCell<GOpts>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -373,6 +552,7 @@ impl State {
             matchparen: RefCell::new(Default::default()),
             perf: Perf::new(),
             ts: RefCell::new(Default::default()),
+            gopts: RefCell::new(GOpts::default()),
         }
     }
 
@@ -388,6 +568,20 @@ impl State {
         self.bufs.borrow_mut().remove(&bufnr);
         self.surround_memo.borrow_mut().remove(&bufnr);
         crate::treesitter::invalidate(self, Some(bufnr));
+    }
+
+    /// Snapshot of the setup(opts) configuration.
+    pub fn gopts(&self) -> GOpts {
+        self.gopts.borrow().clone()
+    }
+
+    pub fn set_gopts(&self, g: GOpts) {
+        *self.gopts.borrow_mut() = g;
+    }
+
+    /// `:NoMatchParen` / `:DoMatchParen` runtime toggle.
+    pub fn set_matchparen_enabled(&self, on: bool) {
+        self.gopts.borrow_mut().matchparen_enabled = on;
     }
 
     /// Translate + compile with the shared cache.

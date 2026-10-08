@@ -72,21 +72,16 @@ fn pos_next_eol(ctx: &Ctx, p: Pos) -> Pos {
     }
 }
 
-/// Port of matchup#util#matchpref: g:matchup_matchpref[&ft][id].
-fn matchpref(id: &str, default: bool) -> bool {
-    use nvim_oxi::conversion::FromObject;
+/// Port of matchup#util#matchpref: matchpref[&ft][id], read from the
+/// setup(opts) configuration (no `g:matchup_matchpref` global).
+fn matchpref(ctx: &Ctx, id: &str, default: bool) -> bool {
     let ft: String = api::eval("&filetype").unwrap_or_default();
-    let d: nvim_oxi::Dictionary = api::get_var("matchup_matchpref").unwrap_or_default();
-    if let Some(ftd) = d.get(ft.as_str()) {
-        if let Ok(dict) = nvim_oxi::Dictionary::from_object(ftd.clone()) {
-            if let Some(v) = dict.get(id) {
-                if let Ok(b) = i64::try_from(v.clone()) {
-                    return b != 0;
-                }
-            }
-        }
-    }
-    default
+    ctx.gopts
+        .matchpref
+        .get(&ft)
+        .and_then(|m| m.get(id))
+        .copied()
+        .unwrap_or(default)
 }
 
 fn ishtmllike() -> bool {
@@ -318,7 +313,7 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
             // make *i% more like *it for html
             if line_count < 2
                 && ishtmllike()
-                && !matchpref("classic_textobj", false)
+                && !matchpref(ctx, "classic_textobj", false)
                 && html_close_like(&close.match_)
                 && !(visual && Pos::new(l1, c1) == Pos::new(l2, c2))
             {
@@ -419,7 +414,7 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
             c2 += close.end_offset();
 
             // make *a% more like *at for html
-            if ishtmllike() && !matchpref("classic_textobj", false) && html_close_like(&close.match_)
+            if ishtmllike() && !matchpref(ctx, "classic_textobj", false) && html_close_like(&close.match_)
             {
                 c1 = c1.saturating_sub(1);
                 if !close.match_.to_lowercase().ends_with('>') {
@@ -514,10 +509,9 @@ fn html_close_like(m: &str) -> bool {
 // keymaps
 // ---------------------------------------------------------------------------
 
-pub fn setup(_state: &SharedState) {
-    let enabled: i64 = api::get_var("matchup_text_obj_enabled").unwrap_or(1);
-    let mappings_enabled: i64 = api::get_var("matchup_mappings_enabled").unwrap_or(1);
-    if enabled == 0 || mappings_enabled == 0 {
+pub fn setup(state: &SharedState) {
+    let g = state.gopts();
+    if !g.text_obj_enabled || !g.mappings_enabled {
         return;
     }
 

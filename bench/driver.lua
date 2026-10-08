@@ -20,6 +20,12 @@ vim.g.matchup_treesitter_enabled = 0
 local api = {}
 if engine == 'rs' then
   local m = require('matchup_rs')
+  -- registers the FileType autocmd (native ftplugin -> b:match_words) and
+  -- configures the engine: classic (treesitter off), offscreen disabled.
+  m.setup({
+    treesitter = { enable = false },
+    matchparen = { offscreen = false },
+  })
   api.matching = function()
     local cur = vim.api.nvim_win_get_cursor(0)
     return m.get_matching_at(cur[1], cur[2] + 1, false)
