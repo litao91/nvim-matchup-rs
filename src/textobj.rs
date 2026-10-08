@@ -4,7 +4,6 @@
 use std::rc::Rc;
 
 use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
-use nvim_oxi::Function;
 
 use crate::engine::{self, Ctx, SurroundOpts};
 use crate::state::State;
@@ -140,11 +139,6 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     let visualmode = obj_str(vars.get(5));
     let sel_start = Pos::new(gi(6) as usize, gi(7) as usize);
     let sel_end = Pos::new(gi(8) as usize, gi(9) as usize);
-    crate::matchparen::trace(&format!(
-        "TOBJ visual={} inner={} sel=({:?},{:?}) count={} count1={} op=[{}] vmode=[{}] mode=[{:?}] cursor={:?}",
-        visual, is_inner, sel_start, sel_end, count, count1, operator, visualmode,
-        ctx.mode, ctx.cursor()
-    ));
 
     let mut win = ctx.win.clone();
 
@@ -225,10 +219,6 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
         let (_open, close_, ml) = match engine::get_surrounding(ctx, cnt, &opts) {
             Some(r) => r,
             None => {
-                crate::matchparen::trace(&format!(
-                    "TOBJ surround FAIL local={} try_again={} cnt={}",
-                    local, try_again, cnt
-                ));
                 if visual {
                     normal("gv");
                 } else {
@@ -492,10 +482,6 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     }
 
     // apply selection
-    crate::matchparen::trace(&format!(
-        "TOBJ apply ({},{})-({},{}) select_mode=[{}]",
-        l1, c1, l2, c2, select_mode
-    ));
     normal(&select_mode);
     normal("o");
     set_cursor(&mut win, ctx, Pos::new(l1, c1));

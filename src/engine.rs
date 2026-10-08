@@ -9,7 +9,7 @@ use fancy_regex::Regex;
 use nvim_oxi::api::{self, Buffer, Window as NvimWindow};
 
 use crate::skip::{in_synstack, skip_at, MidSkip};
-use crate::state::{BufCompiled, GOpts, SharedRegex, State};
+use crate::state::{BufCompiled, GOpts, SharedRegex, State, Union};
 use crate::types::*;
 use crate::vimregex::{fill_backrefs_vim, Opts};
 use crate::words::{process_hlend, remove_capture_groups, Side, SideQuery};
@@ -104,6 +104,9 @@ pub struct Ctx<'a> {
     pub lines: Lines,
     pub mode: String,
     pub synmaxcol: i64,
+    /// Whether vim syntax highlighting is loaded (`g:syntax_on`); when
+    /// false every synID() is 0 and syntax-based skips are constant.
+    pub syntax_on: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -120,6 +123,7 @@ impl<'a> Ctx<'a> {
         let lines = Lines::fetch_for_cursor(&buf, cursor, margin);
         let mode: String = api::eval("mode(1)").unwrap_or_else(|_| "n".to_string());
         let synmaxcol: i64 = api::eval("&synmaxcol").unwrap_or(0);
+        let syntax_on: i64 = api::eval("exists('g:syntax_on')").unwrap_or(0);
         Ctx {
             state,
             bc,
@@ -129,6 +133,7 @@ impl<'a> Ctx<'a> {
             lines,
             mode,
             synmaxcol,
+            syntax_on: syntax_on != 0,
         }
     }
 
@@ -147,6 +152,7 @@ impl<'a> Ctx<'a> {
             word: self.bc.word.clone(),
             ignorecase: self.bc.ignorecase,
             captures,
+            scan: false,
         }
     }
 
@@ -155,7 +161,19 @@ impl<'a> Ctx<'a> {
         let (re, checks, main) =
             self.state
                 .compile_checked(vim, &self.translate_opts(false))?;
-        Some(CPat { main, re, checks })
+        let fast_main = {
+            let mut o = self.translate_opts(false);
+            o.scan = true;
+            // no per-call compile validation: an invalid part makes the
+            // combined compile_fast fail and the scan falls back to fancy
+            self.state.translate_cached(vim, &o).map(|t| t.pattern)
+        };
+        Some(CPat {
+            main,
+            re,
+            checks,
+            fast_main,
+        })
     }
 }
 
@@ -163,6 +181,28 @@ pub struct CPat {
     pub main: String,
     pub re: SharedRegex,
     pub checks: Vec<(SharedRegex, bool)>,
+    /// Lookaround-free DFA pattern for scan loops (over-approximates
+    /// positions; side_at verifies exactly). None when untranslatable.
+    pub fast_main: Option<String>,
+}
+
+/// Scan-loop regex: the DFA variant when available, fancy otherwise.
+enum ScanRe<'a> {
+    Fast(&'a regex::Regex),
+    Fancy(&'a Regex),
+}
+
+impl ScanRe<'_> {
+    fn find_at(&self, line: &str, pos: usize) -> Option<(usize, usize)> {
+        match self {
+            ScanRe::Fast(r) => r.find_at(line, pos).map(|m| (m.start(), m.end())),
+            ScanRe::Fancy(r) => r
+                .find_from_pos(line, pos)
+                .ok()
+                .flatten()
+                .map(|m| (m.start(), m.end())),
+        }
+    }
 }
 
 fn checks_ok(checks: &[(SharedRegex, bool)], line: &str, start0: usize) -> bool {
@@ -263,7 +303,9 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     ctx.state.perf.tic("s:get_delim");
 
     let union = ctx.bc.unions.get(&opts.side)?;
-    let ure = union.re.as_ref()?;
+    if union.empty {
+        return None;
+    }
 
     let cur = match opts.at {
         Some(p) => p,
@@ -292,7 +334,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // check_skip determination (delim.vim:387-400)
     let cursor_skip = {
         let line = ctx.lines.get1(cur.lnum).unwrap_or("");
-        skip_at(&ctx.bc.skip, line, cur.lnum, cursorpos.min(line.len().max(1)))
+        skip_at(&ctx.bc.skip, line, cur.lnum, cursorpos.min(line.len().max(1)), ctx.syntax_on)
     };
     let noskips = ctx.gopts.delim_noskips;
     let check_skip = opts.check_skip.unwrap_or(match opts.direction {
@@ -313,13 +355,21 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     ctx.state.perf.toc("s:get_delim", "setup");
 
     // ---- first pass: locate the match and classify it ----
-    // The union regex is obligation-free (deferred `\@N<=`/`\zs` prefixes),
-    // so a candidate hit that no word claims is a false positive which vim's
-    // engine would never have stopped at: keep scanning. A hit that some word
-    // claims but the parser rejects (syn requirement, \ze extent) mirrors
-    // vim's empty parser result: get_delim fails without retrying.
+    // Next/Prev scan with the lookaround-free DFA union plus the exotic
+    // fancy union: the DFA over-approximates match positions, and a hit
+    // that no word claims (obligations, word boundaries) is a position
+    // vim's engine would not have stopped at, so the scan continues. A
+    // claimed hit that the parser rejects (syn requirement, \ze extent)
+    // mirrors vim's empty parser result: get_delim fails without retry.
+    // Current keeps the exact fancy union: its contains-filter depends on
+    // true match extents.
+    let mut line_hits: Vec<Hit> = Vec::new();
     let found: Option<(Hit, Delim)> = match opts.direction {
         Direction::Current => {
+            let ure = match union.re.as_ref() {
+                Some(r) => r,
+                None => return None,
+            };
             let line = ctx.lines.get1(cur.lnum)?;
             let mut cont: Vec<Hit> = Vec::new();
             let mut pos = 0usize;
@@ -367,35 +417,28 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                     Some(l) => l,
                     None => break,
                 };
-                let mut pos = if lnum == cur.lnum {
-                    bound_up(line, raw0)
-                } else {
-                    0
-                };
-                loop {
-                    let m = match ure.find_from_pos(line, pos) {
-                        Ok(Some(m)) => m,
-                        _ => break,
-                    };
-                    let (s, e) = (m.start(), m.end());
-                    let h = Hit {
-                        lnum,
-                        start0: s,
-                        end0: e,
-                    };
-                    if !reject_by_skip(ctx, h, line, check_skip, true) {
-                        match classify(ctx, line, h, opts, cur0) {
-                            Classify::Claimed(d) => {
-                                out = Some((h, d));
-                                break 'outer;
+                let from0 = if lnum == cur.lnum { raw0 } else { 0 };
+                union_line_hits(union, lnum, line, from0, &mut line_hits);
+                for &h in line_hits.iter() {
+                    // classify before the skip check: the DFA union
+                    // over-approximates, and only positions a word actually
+                    // claims correspond to matches vim's searchpos would
+                    // stop at (and thus skip-check)
+                    match classify(ctx, line, h, opts, cur0) {
+                        Classify::Claimed(d) => {
+                            if reject_by_skip(ctx, h, line, check_skip, true) {
+                                continue;
                             }
-                            Classify::Rejected => return None,
-                            Classify::Unclaimed => {}
+                            out = Some((h, d));
+                            break 'outer;
                         }
-                    }
-                    match next_pos(line, s) {
-                        Some(p) => pos = p,
-                        None => break,
+                        Classify::Rejected => {
+                            if reject_by_skip(ctx, h, line, check_skip, true) {
+                                continue;
+                            }
+                            return None;
+                        }
+                        Classify::Unclaimed => {}
                     }
                 }
             }
@@ -409,36 +452,25 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                     Some(l) => l,
                     None => continue,
                 };
-                let mut hits: Vec<Hit> = Vec::new();
-                let mut pos = 0usize;
-                loop {
-                    let m = match ure.find_from_pos(line, pos) {
-                        Ok(Some(m)) => m,
-                        _ => break,
-                    };
-                    let (s, e) = (m.start(), m.end());
-                    if lnum != cur.lnum || s <= raw0 {
-                        hits.push(Hit {
-                            lnum,
-                            start0: s,
-                            end0: e,
-                        });
-                    }
-                    match next_pos(line, s) {
-                        Some(p) => pos = p,
-                        None => break,
-                    }
+                union_line_hits(union, lnum, line, 0, &mut line_hits);
+                if lnum == cur.lnum {
+                    line_hits.retain(|h| h.start0 <= raw0);
                 }
-                for h in hits.iter().rev() {
-                    if reject_by_skip(ctx, *h, line, check_skip, false) {
-                        continue;
-                    }
-                    match classify(ctx, line, *h, opts, cur0) {
+                for h in line_hits.iter().rev().copied() {
+                    match classify(ctx, line, h, opts, cur0) {
                         Classify::Claimed(d) => {
-                            out = Some((*h, d));
+                            if reject_by_skip(ctx, h, line, check_skip, false) {
+                                continue;
+                            }
+                            out = Some((h, d));
                             break 'outer;
                         }
-                        Classify::Rejected => return None,
+                        Classify::Rejected => {
+                            if reject_by_skip(ctx, h, line, check_skip, false) {
+                                continue;
+                            }
+                            return None;
+                        }
                         Classify::Unclaimed => continue,
                     }
                 }
@@ -458,7 +490,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // skip state recorded on the delim (delim.vim:486-496)
     let mut skip_state = false;
     if !check_skip && (ctx.synmaxcol == 0 || hit.cnum() as i64 <= ctx.synmaxcol) {
-        skip_state = skip_at(&ctx.bc.skip, line, hit.lnum, hit.cnum());
+        skip_state = skip_at(&ctx.bc.skip, line, hit.lnum, hit.cnum(), ctx.syntax_on);
     }
 
     ctx.state.perf.toc("s:get_delim", "got_results");
@@ -477,7 +509,7 @@ fn reject_by_skip(ctx: &Ctx, h: Hit, line: &str, check_skip: bool, forward: bool
     if !should_check {
         return false;
     }
-    if !skip_at(&ctx.bc.skip, line, h.lnum, h.cnum()) {
+    if !skip_at(&ctx.bc.skip, line, h.lnum, h.cnum(), ctx.syntax_on) {
         return false;
     }
     // at buffer edges, accept anyway (delim.vim:448-449)
@@ -512,141 +544,169 @@ enum Classify {
 }
 
 fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -> Classify {
-    let sides = opts.side.sides();
-    let nsets = ctx.bc.sets.len();
+    let dispatch = match ctx.bc.dispatch.get(&opts.side) {
+        Some(d) => d,
+        None => return Classify::Unclaimed,
+    };
+    // candidates whose pattern can start with this byte; hits at EOL
+    // (empty matches) fall back to all words
+    let candidates: &[crate::state::WordRef] = match line.as_bytes().get(hit.start0) {
+        Some(b) => &dispatch.by_byte[*b as usize],
+        None => &dispatch.all,
+    };
+    let prefix = &line[..hit.start0.min(line.len())];
     let mut any_claimed = false;
-    for si in 0..nsets {
+    for wref in candidates {
+        let si = wref.set;
+        let side = wref.side;
+        let mid_id = wref.mid_id;
         let cset = &ctx.bc.sets[si];
         let lset = &ctx.bc.lists.sets[si];
-        for &side in sides {
-            let n_words = if side == Side::Mid {
-                cset.mids.len()
+        let cw = match cset.word(side, mid_id) {
+            Some(w) => w,
+            None => continue,
+        };
+        if cw.classify.is_none() {
+            continue;
+        }
+        let extra_idx = match side {
+            Side::Open => 0,
+            Side::Mid => mid_id,
+            Side::Close => lset.regextwo.extra_list.len().saturating_sub(1),
+        };
+        let extra = lset.regextwo.extra_list.get(extra_idx);
+        let has_hlend = extra.map(|e| e.contains_key("hlend")).unwrap_or(false);
+        let use_hlend = has_hlend && opts.highlighting;
+
+        let (re, checks) = if use_hlend {
+            (
+                cw.hlend_classify.as_ref().or(cw.classify.as_ref()),
+                if cw.hlend_classify.is_some() {
+                    &cw.hlend_checks
+                } else {
+                    &cw.checks
+                },
+            )
+        } else {
+            (cw.classify.as_ref(), &cw.checks)
+        };
+        let re = match re {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // cheap obligation pre-filter: a positive prefix check cannot match
+        // a line prefix that lacks its leading literal
+        let lits = if use_hlend {
+            &cw.hlend_req_lits
+        } else {
+            &cw.req_lits
+        };
+        if !lits.iter().all(|l| prefix.contains(l.as_str())) {
+            continue;
+        }
+        // cheap literal-prefix pre-filter: the anchored classify regex
+        // would otherwise scan to the end of the line before failing
+        if let Some((pref, ic)) = &cw.lit_prefix {
+            let end = hit.start0 + pref.len();
+            if end > line.len() || !line.is_char_boundary(end) {
+                continue;
+            }
+            let seg = &line[hit.start0..end];
+            let ok = if *ic {
+                seg.eq_ignore_ascii_case(pref)
             } else {
-                1
+                seg == pref.as_str()
             };
-            for mid_id in 1..=n_words {
-                let cw = match cset.word(side, mid_id) {
-                    Some(w) => w,
-                    None => continue,
-                };
-                if cw.classify.is_none() {
-                    continue;
-                }
-                let extra_idx = match side {
-                    Side::Open => 0,
-                    Side::Mid => mid_id,
-                    Side::Close => lset.regextwo.extra_list.len().saturating_sub(1),
-                };
-                let extra = lset.regextwo.extra_list.get(extra_idx);
-                let has_hlend = extra.map(|e| e.contains_key("hlend")).unwrap_or(false);
-                let use_hlend = has_hlend && opts.highlighting;
-
-                let (re, checks) = if use_hlend {
-                    (
-                        cw.hlend_classify.as_ref().or(cw.classify.as_ref()),
-                        if cw.hlend_classify.is_some() {
-                            &cw.hlend_checks
-                        } else {
-                            &cw.checks
-                        },
-                    )
-                } else {
-                    (cw.classify.as_ref(), &cw.checks)
-                };
-                let re = match re {
-                    Some(r) => r,
-                    None => continue,
-                };
-
-                let caps = match re.captures_from_pos(line, hit.start0) {
-                    Ok(Some(c)) => c,
-                    _ => continue,
-                };
-                let m0 = match caps.get(0) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                if m0.start() != hit.start0 {
-                    continue;
-                }
-                if !checks_ok(checks, line, hit.start0) {
-                    continue;
-                }
-                // a word's anchored pattern matches here: this is a position
-                // vim's searchpos would have stopped at
-                any_claimed = true;
-                // for current, reject matches the cursor is outside of
-                // (matters for \ze; delim.vim:583-586)
-                if !use_hlend
-                    && opts.direction == Direction::Current
-                    && m0.end() <= cur0
-                {
-                    continue;
-                }
-                // \g{syn;...} requirement (delim.vim:594-607)
-                if let Some(e) = extra {
-                    if let Some(syn_arg) = e.get("syn") {
-                        let (pat, offs) = match syn_arg.split_once(';') {
-                            Some((p, a)) => (p, a.parse::<usize>().unwrap_or(0)),
-                            None => (syn_arg.as_str(), 0),
-                        };
-                        if !in_synstack(pat, hit.lnum, hit.cnum() + offs, &ctx.bc.word) {
-                            continue;
-                        }
-                    }
-                }
-
-                // build the delim
-                let match_text = line[m0.start()..m0.end()].to_string();
-                let two = &lset.regextwo;
-                let word_id = match side {
-                    Side::Open => 0,
-                    Side::Mid => mid_id,
-                    Side::Close => two.mid_list.len() + 1,
-                };
-                let mut groups: HashMap<u32, String> = HashMap::new();
-                let mut augment_str = String::new();
-                let mut augment_unresolved = Default::default();
-                if side == Side::Open {
-                    for &br in &two.need_grp {
-                        if let Some(gm) = caps.get(br as usize) {
-                            if !gm.as_str().is_empty() {
-                                groups.insert(br, gm.as_str().to_string());
-                            }
-                        }
-                    }
-                } else {
-                    if let Some(renu) = two.grp_renu.get(&word_id) {
-                        for (&br, &to) in renu {
-                            let txt = caps
-                                .get(br as usize)
-                                .map(|m| m.as_str())
-                                .unwrap_or("");
-                            groups.insert(to, txt.to_string());
-                        }
-                    }
-                    if let Some(aug) = two.aug_comp.get(&word_id).and_then(|v| v.first()) {
-                        augment_str = fill_backrefs_vim(&aug.str, &groups);
-                        augment_unresolved = aug.outputmap.clone();
-                    }
-                }
-
-                return Classify::Claimed(Delim {
-                    lnum: hit.lnum,
-                    cnum: hit.cnum(),
-                    match_: match_text,
-                    side,
-                    set: si,
-                    word_id,
-                    skip: false,
-                    groups,
-                    augment_str,
-                    augment_unresolved,
-                    highlighting: opts.highlighting,
-                    match_index: 0,
-                });
+            if !ok {
+                continue;
             }
         }
+
+        let caps = match re.captures_from_pos(line, hit.start0) {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        let m0 = match caps.get(0) {
+            Some(m) => m,
+            None => continue,
+        };
+        if m0.start() != hit.start0 {
+            continue;
+        }
+        if !checks_ok(checks, line, hit.start0) {
+            continue;
+        }
+        // a word's anchored pattern matches here: this is a position
+        // vim's searchpos would have stopped at
+        any_claimed = true;
+        // for current, reject matches the cursor is outside of
+        // (matters for \ze; delim.vim:583-586)
+        if !use_hlend && opts.direction == Direction::Current && m0.end() <= cur0 {
+            continue;
+        }
+        // \g{syn;...} requirement (delim.vim:594-607)
+        if let Some(e) = extra {
+            if let Some(syn_arg) = e.get("syn") {
+                let (pat, offs) = match syn_arg.split_once(';') {
+                    Some((p, a)) => (p, a.parse::<usize>().unwrap_or(0)),
+                    None => (syn_arg.as_str(), 0),
+                };
+                if !in_synstack(pat, hit.lnum, hit.cnum() + offs, &ctx.bc.word) {
+                    continue;
+                }
+            }
+        }
+
+        // build the delim
+        let match_text = line[m0.start()..m0.end()].to_string();
+        let two = &lset.regextwo;
+        let word_id = match side {
+            Side::Open => 0,
+            Side::Mid => mid_id,
+            Side::Close => two.mid_list.len() + 1,
+        };
+        let mut groups: HashMap<u32, String> = HashMap::new();
+        let mut augment_str = String::new();
+        let mut augment_unresolved = Default::default();
+        if side == Side::Open {
+            for &br in &two.need_grp {
+                if let Some(gm) = caps.get(br as usize) {
+                    if !gm.as_str().is_empty() {
+                        groups.insert(br, gm.as_str().to_string());
+                    }
+                }
+            }
+        } else {
+            if let Some(renu) = two.grp_renu.get(&word_id) {
+                for (&br, &to) in renu {
+                    let txt = caps
+                        .get(br as usize)
+                        .map(|m| m.as_str())
+                        .unwrap_or("");
+                    groups.insert(to, txt.to_string());
+                }
+            }
+            if let Some(aug) = two.aug_comp.get(&word_id).and_then(|v| v.first()) {
+                augment_str = fill_backrefs_vim(&aug.str, &groups);
+                augment_unresolved = aug.outputmap.clone();
+            }
+        }
+
+        return Classify::Claimed(Delim {
+            lnum: hit.lnum,
+            cnum: hit.cnum(),
+            match_: match_text,
+            side,
+            set: si,
+            word_id,
+            skip: false,
+            groups,
+            augment_str,
+            augment_unresolved,
+            highlighting: opts.highlighting,
+            match_index: 0,
+        });
     }
     if any_claimed {
         Classify::Rejected
@@ -726,7 +786,7 @@ pub fn get_matching_raw(
     let same = open_v == close_v;
 
     let skipfn = |lnum: usize, cnum: usize, line: &str| -> bool {
-        let base = || skip_at(&ctx.bc.skip, line, lnum, cnum) != invert;
+        let base = || skip_at(&ctx.bc.skip, line, lnum, cnum, ctx.syntax_on) != invert;
         match &mid_skip {
             Some(ms) => ms.eval(line, lnum, cnum, base),
             None => base(),
@@ -735,19 +795,44 @@ pub fn get_matching_raw(
 
     // ---- phase 1: find the counterpart ----
     let seed0 = delim.cnum.saturating_sub(1);
-    let combined1 = format!("(?:{})|(?:{})", open_p.main, close_p.main);
-    let comb1 = match Regex::new(&combined1) {
-        Ok(r) => r,
-        Err(_) => return sentinel(),
+    let comb1_fast = match (&open_p.fast_main, &close_p.fast_main) {
+        (Some(o), Some(c)) => {
+            ctx.state.compile_fast(&format!("(?:{o})|(?:{c})"))
+        }
+        _ => None,
+    };
+    // the fancy comb is only needed when the DFA variant is unavailable;
+    // compiling it is expensive, so build it lazily and cache by pattern
+    let comb1_fancy = if comb1_fast.is_none() {
+        let combined1 = format!("(?:{})|(?:{})", open_p.main, close_p.main);
+        match ctx.state.compile_fancy(&combined1) {
+            Some(r) => Some(r),
+            None => return sentinel(),
+        }
+    } else {
+        None
+    };
+    let scan1 = match (&comb1_fast, &comb1_fancy) {
+        (Some(f), _) => ScanRe::Fast(f),
+        (None, Some(r)) => ScanRe::Fancy(r),
+        (None, None) => return sentinel(),
     };
     let corr: Option<Hit> = if same {
         // 'same' matches (delim.vim:763): plain next/prev occurrence,
         // no skip evaluation, no depth counting.
-        scan_same(ctx, &open_p.re, delim.lnum, seed0, down, stopline)
+        let same_fast = open_p
+            .fast_main
+            .as_deref()
+            .and_then(|fm| ctx.state.compile_fast(fm));
+        let sr = match &same_fast {
+            Some(f) => ScanRe::Fast(f),
+            None => ScanRe::Fancy(&open_p.re),
+        };
+        scan_same(ctx, &sr, delim.lnum, seed0, down, stopline)
     } else {
         scan_first(
             ctx,
-            &comb1,
+            &scan1,
             &[&open_p, &close_p],
             delim.lnum,
             seed0,
@@ -844,14 +929,34 @@ pub fn get_matching_raw(
             mids_filled = process_hlend(&mids_filled, -1);
         }
         if let Some(mids_p) = ctx.compile_pat(&mids_filled) {
-            let combined2 = format!(
-                "(?:{})|(?:{})|(?:{})",
-                open_p.main, mids_p.main, close_p.main
-            );
-            if let Ok(comb2) = Regex::new(&combined2) {
+            let comb2_fast = match (
+                &open_p.fast_main,
+                &mids_p.fast_main,
+                &close_p.fast_main,
+            ) {
+                (Some(o), Some(mi), Some(c)) => ctx.state.compile_fast(&format!(
+                    "(?:{o})|(?:{mi})|(?:{c})"
+                )),
+                _ => None,
+            };
+            let comb2_fancy = if comb2_fast.is_none() {
+                let combined2 = format!(
+                    "(?:{})|(?:{})|(?:{})",
+                    open_p.main, mids_p.main, close_p.main
+                );
+                ctx.state.compile_fancy(&combined2)
+            } else {
+                None
+            };
+            let scan2 = match (&comb2_fast, &comb2_fancy) {
+                (Some(f), _) => Some(ScanRe::Fast(f)),
+                (None, Some(r)) => Some(ScanRe::Fancy(r)),
+                _ => None,
+            };
+            if let Some(scan2) = scan2 {
                 let mids = scan_mids(
                     ctx,
-                    &comb2,
+                    &scan2,
                     &[&open_p, &mids_p, &close_p],
                     delim.lnum,
                     seed0,
@@ -877,7 +982,7 @@ pub fn get_matching_raw(
 /// the next/previous occurrence (delim.vim:763-765).
 fn scan_same(
     ctx: &Ctx,
-    re: &Regex,
+    re: &ScanRe,
     seed_lnum: usize,
     seed0: usize,
     down: bool,
@@ -898,11 +1003,11 @@ fn scan_same(
             } else {
                 0
             };
-            if let Ok(Some(m)) = re.find_from_pos(line, pos) {
+            if let Some((s0, e0)) = re.find_at(line, pos) {
                 return Some(Hit {
                     lnum,
-                    start0: m.start(),
-                    end0: m.end(),
+                    start0: s0,
+                    end0: e0,
                 });
             }
         }
@@ -935,7 +1040,7 @@ fn scan_same(
 /// `cands` gives side determination: index 0 = open, 1 = close.
 fn scan_first<F>(
     ctx: &Ctx,
-    comb: &Regex,
+    comb: &ScanRe,
     cands: &[&CPat],
     seed_lnum: usize,
     seed0: usize,
@@ -963,11 +1068,10 @@ where
                 0
             };
             loop {
-                let m = match comb.find_from_pos(line, pos) {
-                    Ok(Some(m)) => m,
-                    _ => break,
+                let (s, e) = match comb.find_at(line, pos) {
+                    Some(x) => x,
+                    None => break,
                 };
-                let s = m.start();
                 if skipfn(lnum, s + 1, line) {
                     match next_pos(line, s) {
                         Some(p) => pos = p,
@@ -982,7 +1086,7 @@ where
                             return Some(Hit {
                                 lnum,
                                 start0: s,
-                                end0: m.end(),
+                                end0: e,
                             });
                         }
                         depth -= 1;
@@ -1037,7 +1141,7 @@ where
 /// cands: [open, mids, close].
 fn scan_mids<F>(
     ctx: &Ctx,
-    comb: &Regex,
+    comb: &ScanRe,
     cands: &[&CPat],
     seed_lnum: usize,
     seed0: usize,
@@ -1073,11 +1177,10 @@ where
                 0
             };
             loop {
-                let m = match comb.find_from_pos(line, pos) {
-                    Ok(Some(m)) => m,
-                    _ => break,
+                let (s, e) = match comb.find_at(line, pos) {
+                    Some(x) => x,
+                    None => break,
                 };
-                let s = m.start();
                 if past_corr(lnum, s) {
                     return out;
                 }
@@ -1100,7 +1203,7 @@ where
                                 .flatten()
                                 .filter(|mm| mm.start() == s)
                                 .map(|mm| line[mm.start()..mm.end()].to_string())
-                                .unwrap_or_else(|| m.as_str().to_string());
+                                .unwrap_or_else(|| line[s..e].to_string());
                             out.push((extent, lnum, s + 1));
                         }
                     }
@@ -1168,20 +1271,71 @@ where
     out
 }
 
-fn enum_line(re: &Regex, line: &str, from0: usize) -> Vec<Hit> {
+/// Enumerate union hits on one line for Next/Prev scans: the DFA union
+/// (over-approximate positions, exact starts) plus the exotic fancy union,
+/// merged and deduplicated by start position.
+fn union_line_hits(
+    union: &Union,
+    lnum: usize,
+    line: &str,
+    from0: usize,
+    out: &mut Vec<Hit>,
+) {
+    out.clear();
+    if let Some(fast) = union.fast.as_ref() {
+        let mut pos = bound_up(line, from0);
+        loop {
+            let m = match fast.find_at(line, pos) {
+                Some(m) => m,
+                None => break,
+            };
+            out.push(Hit {
+                lnum,
+                start0: m.start(),
+                end0: m.end(),
+            });
+            match next_pos(line, m.start()) {
+                Some(p) => pos = p,
+                None => break,
+            }
+        }
+    }
+    if let Some(ex) = union.exotic.as_ref() {
+        let mut pos = bound_up(line, from0);
+        loop {
+            let m = match ex.find_from_pos(line, pos) {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            out.push(Hit {
+                lnum,
+                start0: m.start(),
+                end0: m.end(),
+            });
+            match next_pos(line, m.start()) {
+                Some(p) => pos = p,
+                None => break,
+            }
+        }
+    }
+    out.sort_by_key(|h| h.start0);
+    out.dedup_by_key(|h| h.start0);
+}
+
+fn enum_line(re: &ScanRe, line: &str, from0: usize) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut pos = bound_up(line, from0);
     loop {
-        let m = match re.find_from_pos(line, pos) {
-            Ok(Some(m)) => m,
-            _ => break,
+        let (s0, e0) = match re.find_at(line, pos) {
+            Some(x) => x,
+            None => break,
         };
         hits.push(Hit {
             lnum: 0,
-            start0: m.start(),
-            end0: m.end(),
+            start0: s0,
+            end0: e0,
         });
-        match next_pos(line, m.start()) {
+        match next_pos(line, s0) {
             Some(p) => pos = p,
             None => break,
         }
@@ -1355,7 +1509,7 @@ pub fn get_surrounding(
 
     let cursor_skip = {
         let line = ctx.lines.get1(cursor.lnum).unwrap_or("");
-        skip_at(&ctx.bc.skip, line, cursor.lnum, cursor.cnum)
+        skip_at(&ctx.bc.skip, line, cursor.lnum, cursor.cnum, ctx.syntax_on)
     };
     let check_skip = if opts.check_skip {
         Some(true)

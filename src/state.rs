@@ -13,7 +13,7 @@ use nvim_oxi::api::{self, Buffer};
 
 use crate::skip::{compile_skip, SkipKind};
 use crate::types::Delim;
-use crate::vimregex::{translate, Opts};
+use crate::vimregex::{self, translate, Opts};
 use crate::words::*;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,20 @@ pub struct CompiledWord {
     pub hlend_classify: Option<SharedRegex>,
     pub hlend_checks: Vec<(SharedRegex, bool)>,
     pub has_hlend: bool,
+    /// Bytes a match of this word can start with; None = undetermined
+    /// (the word is a classify candidate at every position).
+    pub first: Option<vimregex::FirstBytes>,
+    /// Lookaround-free over-approximation for the DFA scan union
+    /// (`regex` crate); None when the word cannot be scan-translated.
+    pub fast_main: Option<String>,
+    /// Mandatory literal prefix of matches (string, case-insensitive):
+    /// cheap filter before the anchored classify regex.
+    pub lit_prefix: Option<(String, bool)>,
+    /// Literals that must occur in the line prefix before a match for the
+    /// positive prefix-check obligations to hold; a cheap pre-filter that
+    /// skips the anchored capture regex entirely.
+    pub req_lits: Vec<String>,
+    pub hlend_req_lits: Vec<String>,
 }
 
 pub struct CompiledSet {
@@ -59,16 +73,38 @@ impl CompiledSet {
 }
 
 pub struct Union {
+    /// Full fancy-regex union (exact extents): used for Current scans.
     pub re: Option<SharedRegex>,
+    /// Lookaround-free DFA union (over-approximate positions; classify
+    /// filters exactly): used for Next/Prev multi-line scans.
+    pub fast: Option<regex::Regex>,
+    /// Fancy union of the words that could not be scan-translated.
+    pub exotic: Option<SharedRegex>,
     /// (set index, side, mid_id) alternatives in union order, for
     /// diagnostics; classification re-tries patterns anyway.
     pub empty: bool,
+}
+
+/// A (set, side, word) slot, for classify candidate dispatch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WordRef {
+    pub set: usize,
+    pub side: Side,
+    pub mid_id: usize,
+}
+
+/// Classify candidates indexed by the first byte at the hit position.
+pub struct Dispatch {
+    pub by_byte: Vec<Vec<WordRef>>,
+    /// All words in classify order, for positions with no byte (EOL).
+    pub all: Vec<WordRef>,
 }
 
 pub struct BufCompiled {
     pub lists: DelimLists,
     pub sets: Vec<CompiledSet>,
     pub unions: HashMap<SideQuery, Union>,
+    pub dispatch: HashMap<SideQuery, Dispatch>,
     /// Word character class derived from &iskeyword.
     pub word: String,
     pub ignorecase: bool,
@@ -274,12 +310,25 @@ pub struct State {
     pub op_operator: RefCell<String>,
     pub bufs: RefCell<HashMap<i32, BufCompiled>>,
     pub regex_cache: RefCell<HashMap<String, SharedRegex>>,
+    /// Cache for lookaround-free `regex`-crate scan patterns.
+    pub fast_cache: RefCell<HashMap<String, regex::Regex>>,
+    /// Translation cache: (pattern, word, ignorecase, captures, scan).
+    pub trans_cache: RefCell<HashMap<TransKey, vimregex::Translated>>,
     /// Cache for expression-valued b:match_words (loader.vim:123).
     pub expr_cache: RefCell<HashMap<String, String>>,
     /// get_surrounding memo: buf -> (changedtick, memo map).
     pub surround_memo: RefCell<HashMap<i32, (u32, HashMap<MemoKey, Option<Delim>>)>>,
     pub matchparen: RefCell<crate::matchparen::MatchParenState>,
     pub perf: Perf,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct TransKey {
+    pub pattern: String,
+    pub word: String,
+    pub ignorecase: bool,
+    pub captures: bool,
+    pub scan: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -296,6 +345,8 @@ impl State {
             op_operator: RefCell::new(String::new()),
             bufs: RefCell::new(HashMap::new()),
             regex_cache: RefCell::new(HashMap::new()),
+            fast_cache: RefCell::new(HashMap::new()),
+            trans_cache: RefCell::new(HashMap::new()),
             expr_cache: RefCell::new(HashMap::new()),
             surround_memo: RefCell::new(HashMap::new()),
             matchparen: RefCell::new(Default::default()),
@@ -313,7 +364,7 @@ impl State {
     pub fn compile(&self, pattern: &str, opts: &Opts) -> Option<SharedRegex> {
         // Translate (cheap, deterministic) then look up the compiled regex
         // by its translated pattern string.
-        let t = translate(pattern, opts).ok()?;
+        let t = self.translate_cached(pattern, opts)?;
         if !t.prefix_checks.is_empty() {
             // Callers that cannot honor prefix checks must not use this
             // path; they use compile_word/compile_checked instead.
@@ -328,6 +379,53 @@ impl State {
         Some(re)
     }
 
+    /// Translate with a cache keyed by pattern and options.
+    pub fn translate_cached(&self, pattern: &str, opts: &Opts) -> Option<vimregex::Translated> {
+        let key = TransKey {
+            pattern: pattern.to_string(),
+            word: opts.word.clone(),
+            ignorecase: opts.ignorecase,
+            captures: opts.captures,
+            scan: opts.scan,
+        };
+        if let Some(t) = self.trans_cache.borrow().get(&key) {
+            return Some(t.clone());
+        }
+        let t = translate(pattern, opts).ok()?;
+        self.trans_cache.borrow_mut().insert(key, t.clone());
+        Some(t)
+    }
+
+    /// Compile (and cache) a fancy-regex pattern by its translated form.
+    pub fn compile_fancy(&self, pattern: &str) -> Option<SharedRegex> {
+        {
+            let cache = self.regex_cache.borrow();
+            if let Some(r) = cache.get(pattern) {
+                return Some(Rc::clone(r));
+            }
+        }
+        let re = Rc::new(Regex::new(pattern).ok()?);
+        self.regex_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), Rc::clone(&re));
+        Some(re)
+    }
+
+    /// Compile (and cache) a lookaround-free scan pattern for the DFA.
+    pub fn compile_fast(&self, pattern: &str) -> Option<regex::Regex> {
+        {
+            let cache = self.fast_cache.borrow();
+            if let Some(r) = cache.get(pattern) {
+                return Some(r.clone());
+            }
+        }
+        let r = regex::Regex::new(pattern).ok()?;
+        self.fast_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), r.clone());
+        Some(r)
+    }
+
     /// Compile a pattern that may carry prefix-check obligations.
     /// Returns (compiled main, checks, main pattern string).
     pub fn compile_checked(
@@ -335,7 +433,7 @@ impl State {
         pattern: &str,
         opts: &Opts,
     ) -> Option<(SharedRegex, Vec<(SharedRegex, bool)>, String)> {
-        let t = translate(pattern, opts).ok()?;
+        let t = self.translate_cached(pattern, opts)?;
         let main = {
             let mut cache = self.regex_cache.borrow_mut();
             match cache.get(&t.pattern) {
@@ -621,11 +719,13 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
         word: word.clone(),
         ignorecase,
         captures: false,
+        scan: false,
     };
     let opts_class = Opts {
         word: word.clone(),
         ignorecase,
         captures: true,
+        scan: false,
     };
 
     let mut sets: Vec<CompiledSet> = Vec::with_capacity(lists.sets.len());
@@ -650,59 +750,125 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
     let mut unions = HashMap::new();
     for q in SideQuery::ALL {
         let mut parts: Vec<&str> = Vec::new();
-        for (si, set) in lists.sets.iter().enumerate() {
-            for side in q.sides() {
-                match side {
-                    Side::Open => {
-                        if sets[si].open.scan.is_some() {
-                            parts.push(&sets[si].open.main);
-                        }
+        let mut fast_parts: Vec<&str> = Vec::new();
+        let mut exotic_parts: Vec<&str> = Vec::new();
+        for si in 0..sets.len() {
+            let cset = &sets[si];
+            for &side in q.sides() {
+                let n_words = if side == Side::Mid {
+                    cset.mids.len()
+                } else {
+                    1
+                };
+                for mid_id in 1..=n_words {
+                    let cw = match cset.word(side, mid_id) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    if cw.scan.is_none() || cw.main.is_empty() {
+                        continue;
                     }
-                    Side::Mid => {
-                        for m in &sets[si].mids {
-                            if m.scan.is_some() {
-                                parts.push(&m.main);
-                            }
-                        }
-                    }
-                    Side::Close => {
-                        if sets[si].close.scan.is_some() {
-                            parts.push(&sets[si].close.main);
-                        }
+                    parts.push(&cw.main);
+                    match cw.fast_main.as_deref() {
+                        Some(fm) => fast_parts.push(fm),
+                        None => exotic_parts.push(&cw.main),
                     }
                 }
             }
-            let _ = set;
         }
-        let union = if parts.is_empty() {
-            Union {
-                re: None,
-                empty: true,
-            }
-        } else {
-            let combined = parts
-                .iter()
+        let join = |ps: &[&str]| {
+            ps.iter()
                 .map(|p| format!("(?:{p})"))
                 .collect::<Vec<_>>()
-                .join("|");
-            let re = {
-                let mut cache = state.regex_cache.borrow_mut();
-                match cache.get(&combined) {
-                    Some(re) => Some(Rc::clone(re)),
-                    None => Regex::new(&combined).ok().map(|re| {
-                        let re = Rc::new(re);
-                        cache.insert(combined.clone(), Rc::clone(&re));
-                        re
-                    }),
-                }
-            };
-            let empty = re.is_none();
-            Union { re, empty }
+                .join("|")
         };
-        unions.insert(q, union);
+        let fancy_union = |combined: String| -> Option<SharedRegex> {
+            let mut cache = state.regex_cache.borrow_mut();
+            match cache.get(&combined) {
+                Some(re) => Some(Rc::clone(re)),
+                None => Regex::new(&combined).ok().map(|re| {
+                    let re = Rc::new(re);
+                    cache.insert(combined.clone(), Rc::clone(&re));
+                    re
+                }),
+            }
+        };
+        let re = if parts.is_empty() {
+            None
+        } else {
+            fancy_union(join(&parts))
+        };
+        let fast = if fast_parts.is_empty() {
+            None
+        } else {
+            regex::Regex::new(&join(&fast_parts)).ok()
+        };
+        let exotic = if exotic_parts.is_empty() {
+            None
+        } else {
+            fancy_union(join(&exotic_parts))
+        };
+        let empty = re.is_none() && fast.is_none() && exotic.is_none();
+        unions.insert(
+            q,
+            Union {
+                re,
+                fast,
+                exotic,
+                empty,
+            },
+        );
     }
 
     let skip = compile_skip(&match_skip, &word);
+
+    // classify candidate dispatch: words that can match at a position,
+    // indexed by the position's first byte, in classify order
+    let mut dispatch = HashMap::new();
+    for q in SideQuery::ALL {
+        let mut by_byte: Vec<Vec<WordRef>> = vec![Vec::new(); 256];
+        let mut all: Vec<WordRef> = Vec::new();
+        for si in 0..sets.len() {
+            let cset = &sets[si];
+            for &side in q.sides() {
+                let n_words = if side == Side::Mid {
+                    cset.mids.len()
+                } else {
+                    1
+                };
+                for mid_id in 1..=n_words {
+                    let cw = match cset.word(side, mid_id) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    if cw.classify.is_none() {
+                        continue;
+                    }
+                    let wref = WordRef {
+                        set: si,
+                        side,
+                        mid_id,
+                    };
+                    all.push(wref);
+                    match cw.first {
+                        None => {
+                            for v in by_byte.iter_mut() {
+                                v.push(wref);
+                            }
+                        }
+                        Some(fb) => {
+                            for b in 0..=255usize {
+                                if fb.contains(b as u8) {
+                                    by_byte[b].push(wref);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dispatch.insert(q, Dispatch { by_byte, all });
+    }
 
     state.bufs.borrow_mut().insert(
         h,
@@ -710,6 +876,7 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
             lists,
             sets,
             unions,
+            dispatch,
             word,
             ignorecase,
             skip,
@@ -738,6 +905,11 @@ fn compile_word(
             hlend_classify: None,
             hlend_checks: vec![],
             has_hlend: false,
+            first: None,
+            fast_main: None,
+            lit_prefix: None,
+            req_lits: vec![],
+            hlend_req_lits: vec![],
         };
     }
     let scan_t = translate(vim, opts_scan).ok();
@@ -756,20 +928,31 @@ fn compile_word(
         Some((re, checks, _)) => (Some(re), checks),
         None => (None, vec![]),
     };
+    let first = vimregex::first_bytes(vim, opts_scan.ignorecase);
+    let lit_prefix = vimregex::literal_prefix(vim, opts_class.ignorecase, 16);
+    let req_lits = positive_check_lits(vim, opts_class);
+    let fast_main = {
+        let mut o = opts_scan.clone();
+        o.scan = true;
+        translate(vim, &o)
+            .ok()
+            .map(|t| t.pattern)
+            .filter(|p| regex::Regex::new(p).is_ok())
+    };
 
     let has_hlend = two
         .extra_list
         .get(extra_idx)
         .map(|e| e.contains_key("hlend"))
         .unwrap_or(false);
-    let (hlend_classify, hlend_checks) = if has_hlend {
+    let (hlend_classify, hlend_checks, hlend_req_lits) = if has_hlend {
         let p = process_hlend(vim, -1);
         match state.compile_checked(&p, opts_class) {
-            Some((re, checks, _)) => (Some(re), checks),
-            None => (None, vec![]),
+            Some((re, checks, _)) => (Some(re), checks, positive_check_lits(&p, opts_class)),
+            None => (None, vec![], vec![]),
         }
     } else {
-        (None, vec![])
+        (None, vec![], vec![])
     };
 
     CompiledWord {
@@ -781,7 +964,58 @@ fn compile_word(
         hlend_classify,
         hlend_checks,
         has_hlend,
+        first,
+        fast_main,
+        lit_prefix,
+        req_lits,
+        hlend_req_lits,
     }
+}
+
+/// Leading literal of a regex fragment, if any (stops at the first
+/// metacharacter; escaped punctuation counts as that literal character).
+fn leading_literal(pat: &str) -> Option<String> {
+    let mut lit = String::new();
+    let mut it = pat.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(e) = it.next() {
+                    if e.is_ascii_punctuation() {
+                        lit.push(e);
+                    }
+                }
+                break;
+            }
+            '(' | ')' | '[' | ']' | '{' | '}' | '?' | '*' | '+' | '|' | '^'
+            | '$' | '.' => break,
+            _ => lit.push(c),
+        }
+    }
+    if lit.is_empty() {
+        None
+    } else {
+        Some(lit)
+    }
+}
+
+/// Mandatory prefix literals implied by a pattern's positive prefix-check
+/// obligations: none of them can match a line prefix lacking the literal.
+fn positive_check_lits(vim: &str, opts: &Opts) -> Vec<String> {
+    let t = match translate(vim, opts) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+    let mut lits = Vec::new();
+    for c in &t.prefix_checks {
+        if c.neg {
+            continue;
+        }
+        if let Some(l) = leading_literal(&c.pattern) {
+            lits.push(l);
+        }
+    }
+    lits
 }
 
 #[cfg(test)]

@@ -4,7 +4,6 @@
 use std::rc::Rc;
 
 use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
-use nvim_oxi::Function;
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts, SurroundOpts};
 use crate::state::State;
@@ -61,6 +60,7 @@ fn motion_force() -> String {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // batched in one eval for port fidelity
 struct Vars {
     count: i64,
     count1: i64,
@@ -73,7 +73,7 @@ struct Vars {
 }
 
 fn read_vars(ctx: &Ctx) -> Vars {
-    let mut vals: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
+    let vals: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
         "[v:count, v:count1, v:operator, v:register, &selection, visualmode(), &foldopen, &startofline]",
     )
     .map(|a| a.into_iter().collect())

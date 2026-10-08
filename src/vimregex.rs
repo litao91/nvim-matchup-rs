@@ -32,6 +32,12 @@ pub struct Opts {
     /// When false, capture groups not needed by backrefs are demoted to
     /// non-capturing groups (port of `matchup#loader#remove_capture_groups`).
     pub captures: bool,
+    /// Scan mode: emit a lookaround-free OVER-approximation suitable for
+    /// the `regex` crate (DFA). Word boundaries, lookaheads and lookbehinds
+    /// are dropped (positions they would reject are filtered later by the
+    /// exact classify patterns); backrefs and `\zs`/`\ze` fail translation
+    /// so such words keep using the fancy-regex scan union.
+    pub scan: bool,
 }
 
 impl Default for Opts {
@@ -40,6 +46,7 @@ impl Default for Opts {
             word: r"\w".to_string(),
             ignorecase: false,
             captures: true,
+            scan: false,
         }
     }
 }
@@ -129,6 +136,258 @@ pub struct Translated {
 }
 
 // ---------------------------------------------------------------------------
+// First-byte analysis (scan candidate dispatch)
+// ---------------------------------------------------------------------------
+
+/// Set of bytes a match of a pattern can start with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FirstBytes(pub [u64; 4]);
+
+impl FirstBytes {
+    pub fn empty() -> FirstBytes {
+        FirstBytes([0; 4])
+    }
+    pub fn insert(&mut self, b: u8) {
+        self.0[(b >> 6) as usize] |= 1u64 << (b & 63);
+    }
+    pub fn contains(&self, b: u8) -> bool {
+        (self.0[(b >> 6) as usize] >> (b & 63)) & 1 == 1
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|&x| x == 0)
+    }
+    pub fn merge(&mut self, other: &FirstBytes) {
+        for i in 0..4 {
+            self.0[i] |= other.0[i];
+        }
+    }
+}
+
+/// Possible first bytes of non-empty matches of the vim regex `re`.
+/// `None` means undetermined: the caller must treat the pattern as a
+/// candidate at every position.
+pub fn first_bytes(re: &str, ignorecase: bool) -> Option<FirstBytes> {
+    let mut p = Parser {
+        cs: re.chars().collect(),
+        i: 0,
+        case_override: None,
+        warnings: Vec::new(),
+    };
+    let ast = p.parse_alt().ok()?;
+    if p.i != p.cs.len() {
+        return None;
+    }
+    let ic = p.case_override.unwrap_or(ignorecase);
+    // a pattern that can match empty has no determined first byte
+    if min_size(&ast) == 0 {
+        return None;
+    }
+    fb_node(&ast, ic)
+}
+
+fn fb_insert_lit(fb: &mut FirstBytes, b: u8, ic: bool) {
+    fb.insert(b);
+    if ic && b.is_ascii_alphabetic() {
+        fb.insert(if b.is_ascii_lowercase() {
+            b - 32
+        } else {
+            b + 32
+        });
+    }
+}
+
+/// First bytes contributed by a single node. `Some(empty)` means the node
+/// is zero-width (contributes nothing); `None` means undetermined.
+fn fb_node(n: &Node, ic: bool) -> Option<FirstBytes> {
+    match n {
+        Node::Empty
+        | Node::AnchorStart
+        | Node::AnchorEnd
+        | Node::WordStart
+        | Node::WordEnd
+        | Node::MatchStart
+        | Node::MatchEnd
+        | Node::Lookahead { .. }
+        | Node::Lookbehind { .. } => Some(FirstBytes::empty()),
+        Node::Raw(s) => {
+            let b = s.as_bytes();
+            if b.is_empty() {
+                return Some(FirstBytes::empty());
+            }
+            let mut fb = FirstBytes::empty();
+            if b[0] == b'\\' {
+                match b.get(1) {
+                    // escaped punctuation is that literal character
+                    Some(&c) if c.is_ascii_punctuation() => fb.insert(c),
+                    // \s \d \w ... : undetermined
+                    _ => return None,
+                }
+            } else {
+                fb_insert_lit(&mut fb, b[0], ic);
+            }
+            Some(fb)
+        }
+        // bracket classes are not analyzed; be conservative
+        Node::Class(_) | Node::Backref(_) => None,
+        Node::Group { alt, .. } | Node::Alt(alt) | Node::Optional { alt } => {
+            let mut fb = FirstBytes::empty();
+            for a in alt {
+                match fb_node(a, ic) {
+                    None => return None,
+                    Some(s) => fb.merge(&s),
+                }
+            }
+            Some(fb)
+        }
+        // conjunction extent is the last branch's
+        Node::Conj(v) => v.last().map(|x| fb_node(x, ic)).unwrap_or(None),
+        Node::Quantified { atom, .. } => fb_node(atom, ic),
+        Node::Concat(v) => fb_concat(v, ic),
+    }
+}
+
+fn fb_concat(nodes: &[Node], ic: bool) -> Option<FirstBytes> {
+    // a leading `\zs` moves the match start: only bytes after the last
+    // MatchStart can begin the match
+    let start = nodes
+        .iter()
+        .rposition(|n| matches!(n, Node::MatchStart))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut acc = FirstBytes::empty();
+    for n in &nodes[start..] {
+        match fb_node(n, ic) {
+            None => return None,
+            Some(s) => acc.merge(&s),
+        }
+        if min_size(n) > 0 {
+            break;
+        }
+    }
+    if acc.is_empty() {
+        None
+    } else {
+        Some(acc)
+    }
+}
+
+/// Mandatory literal prefix of matches of the vim regex `re`, truncated to
+/// `limit` bytes: every non-empty match starts with it (modulo case when
+/// the returned flag is true). Used as a cheap filter before running the
+/// anchored classify regexes. `None` = no usable literal prefix.
+pub fn literal_prefix(re: &str, ignorecase: bool, limit: usize) -> Option<(String, bool)> {
+    let mut p = Parser {
+        cs: re.chars().collect(),
+        i: 0,
+        case_override: None,
+        warnings: Vec::new(),
+    };
+    let ast = p.parse_alt().ok()?;
+    if p.i != p.cs.len() {
+        return None;
+    }
+    let ic = p.case_override.unwrap_or(ignorecase);
+    if min_size(&ast) == 0 {
+        return None;
+    }
+    let (out, _) = lp_node(&ast, limit);
+    if out.is_empty() {
+        None
+    } else {
+        Some((out, ic))
+    }
+}
+
+/// Collect the mandatory literal prefix of one node. The bool reports
+/// whether the node is fully literal (so a following concat node can
+/// extend the prefix).
+fn lp_node(n: &Node, limit: usize) -> (String, bool) {
+    let mut out = String::new();
+    match n {
+        Node::Raw(s) => {
+            let mut cs = s.chars();
+            while out.len() < limit {
+                match cs.next() {
+                    None => return (out, true),
+                    Some('\\') => match cs.next() {
+                        Some(e) if e.is_ascii_punctuation() => out.push(e),
+                        // \s \d ... : not a literal
+                        _ => return (out, false),
+                    },
+                    Some(c) => out.push(c),
+                }
+            }
+            (out, false)
+        }
+        Node::Concat(v) => {
+            let start = v
+                .iter()
+                .rposition(|x| matches!(x, Node::MatchStart))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            for x in &v[start..] {
+                if out.len() >= limit {
+                    break;
+                }
+                match x {
+                    Node::Empty
+                    | Node::AnchorStart
+                    | Node::AnchorEnd
+                    | Node::WordStart
+                    | Node::WordEnd
+                    | Node::MatchEnd
+                    | Node::Lookahead { .. }
+                    | Node::Lookbehind { .. } => continue,
+                    Node::MatchStart => {
+                        out.clear();
+                        continue;
+                    }
+                    _ => {}
+                }
+                if min_size(x) == 0 {
+                    break;
+                }
+                let (p, full) = lp_node(x, limit - out.len());
+                out.push_str(&p);
+                if !full {
+                    break;
+                }
+            }
+            (out, false)
+        }
+        Node::Group { alt, .. } | Node::Alt(alt) => {
+            // longest common prefix across branches
+            let mut it = alt.iter();
+            let first = match it.next() {
+                Some(a) => lp_node(a, limit).0,
+                None => return (out, false),
+            };
+            let mut common: Vec<char> = first.chars().collect();
+            for a in it {
+                let (p, _) = lp_node(a, limit);
+                let pc: Vec<char> = p.chars().collect();
+                let n = common
+                    .iter()
+                    .zip(pc.iter())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                common.truncate(n);
+            }
+            (common.into_iter().collect::<String>(), false)
+        }
+        Node::Conj(v) => match v.last() {
+            Some(x) => lp_node(x, limit),
+            None => (out, false),
+        },
+        Node::Quantified { atom, q, .. } => match q {
+            Quant::Plus | Quant::Range(1, _) => lp_node(atom, limit),
+            _ => (out, false),
+        },
+        _ => (out, false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
@@ -156,6 +415,14 @@ pub fn translate(re: &str, opts: &Opts) -> Result<Translated> {
             "unexpected token at offset {} in {:?}",
             p.i, re
         )));
+    }
+
+    if opts.scan && contains_match_marker(&ast) {
+        // \zs/\ze move match boundaries in ways the scan emitter cannot
+        // express; such words keep using the fancy-regex scan union
+        return Err(TranslateError(
+            r"scan mode does not support \zs/\ze".to_string(),
+        ));
     }
 
     // Collect backref numbers to decide which captures must be kept when
@@ -1029,6 +1296,20 @@ fn contains_capture(n: &Node) -> bool {
     }
 }
 
+fn contains_match_marker(n: &Node) -> bool {
+    match n {
+        Node::MatchStart | Node::MatchEnd => true,
+        Node::Group { alt, .. } | Node::Optional { alt } | Node::Alt(alt) | Node::Conj(alt) => {
+            alt.iter().any(contains_match_marker)
+        }
+        Node::Concat(v) => v.iter().any(contains_match_marker),
+        Node::Quantified { atom, .. }
+        | Node::Lookahead { atom, .. }
+        | Node::Lookbehind { atom, .. } => contains_match_marker(atom),
+        _ => false,
+    }
+}
+
 /// Emit a `\%[...]` branch as progressively-optional atoms:
 /// `[a, b, c]` becomes `(?:a(?:b(?:c)?)?)?`.
 fn emit_seq_opt(a: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
@@ -1127,6 +1408,11 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
             }
         }
         Node::Lookahead { atom, neg } => {
+            if ec.opts.scan {
+                // over-approximate: dropping the assertion only admits more
+                // candidate positions, which classify filters exactly
+                return Ok(());
+            }
             out.push_str(if *neg { "(?!" } else { "(?=" });
             let was_top = std::mem::replace(&mut ec.top, false);
             let was_leading = std::mem::replace(&mut ec.leading, false);
@@ -1136,6 +1422,9 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
             out.push(')');
         }
         Node::Lookbehind { atom, neg } => {
+            if ec.opts.scan {
+                return Ok(());
+            }
             if fixed_size(atom) {
                 out.push_str(if *neg { "(?<!" } else { "(?<=" });
                 let was_top = std::mem::replace(&mut ec.top, false);
@@ -1160,7 +1449,14 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
                 ));
             }
         }
-        Node::Backref(b) => out.push_str(&format!("\\{b}")),
+        Node::Backref(b) => {
+            if ec.opts.scan {
+                return Err(TranslateError(
+                    "backref not supported in scan mode".to_string(),
+                ));
+            }
+            out.push_str(&format!("\\{b}"));
+        }
         Node::Concat(v) => {
             if ec.top {
                 emit_top_concat(v, out, ec)?;
@@ -1186,6 +1482,12 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
         Node::Conj(v) => {
             // (?=A)(?=B)C — extent of the last branch.
             let was_top = std::mem::replace(&mut ec.top, false);
+            if ec.opts.scan {
+                // over-approximate: keep only the extent-determining branch
+                emit(v.last().unwrap(), out, ec)?;
+                ec.top = was_top;
+                return Ok(());
+            }
             for x in &v[..v.len() - 1] {
                 out.push_str("(?=");
                 let was_leading = std::mem::replace(&mut ec.leading, false);
@@ -1199,10 +1501,14 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
         Node::AnchorStart => out.push('^'),
         Node::AnchorEnd => out.push('$'),
         Node::WordStart => {
-            out.push_str(&format!("(?<!{w})(?={w})", w = ec.opts.word));
+            if !ec.opts.scan {
+                out.push_str(&format!("(?<!{w})(?={w})", w = ec.opts.word));
+            }
         }
         Node::WordEnd => {
-            out.push_str(&format!("(?<={})(?!{})", ec.opts.word, ec.opts.word));
+            if !ec.opts.scan {
+                out.push_str(&format!("(?<={})(?!{})", ec.opts.word, ec.opts.word));
+            }
         }
         Node::MatchStart | Node::MatchEnd => {
             // Only meaningful at top level; dropped elsewhere.
@@ -1669,6 +1975,27 @@ mod tests {
         assert_eq!(m("x = els"), Some((4, "els".to_string())));
         assert_eq!(m("elif"), None);
         assert_eq!(m("element"), None); // \> blocks the partial match
+    }
+
+    #[test]
+    fn literal_prefix_works() {
+        let lp = |re: &str| literal_prefix(re, false, 16).map(|(s, ic)| (s, ic));
+        assert_eq!(lp(r"\<endif\>"), Some(("endif".to_string(), false)));
+        assert_eq!(lp(r"\<el\%[seif]\>"), Some(("el".to_string(), false)));
+        assert_eq!(
+            lp(r"\%(\%(^\||\)\s*\)\@<=\<retu\%[rn]\>"),
+            Some(("retu".to_string(), false))
+        );
+        // alternation: common prefix only
+        assert_eq!(lp(r"\%(endif\|endfor\)"), Some(("end".to_string(), false)));
+        assert_eq!(lp(r"\%(fu\%[nction]\|def\)"), None);
+        // class start: no literal
+        assert_eq!(lp(r"\S\+"), None);
+        // case flag propagates
+        assert_eq!(
+            literal_prefix(r"\cfoo", false, 16),
+            Some(("foo".to_string(), true))
+        );
     }
 
     #[test]

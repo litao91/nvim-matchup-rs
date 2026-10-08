@@ -17,7 +17,13 @@ pub enum SkipKind {
     /// (matchup#util#in_comment_or_string).
     Default,
     /// `s:re` / `S:re`: syntax group name at position (un)matched.
-    Syn { re: Regex, invert: bool },
+    /// `empty` is the result for the empty syntax name, i.e. the answer
+    /// whenever syntax highlighting is inactive (synID() == 0).
+    Syn {
+        re: Regex,
+        invert: bool,
+        empty: bool,
+    },
     /// `r:re` / `R:re`: line prefix up to position (un)matched.
     Prefix { re: Regex, invert: bool },
     /// Raw vimscript expression, evaluated through the
@@ -43,12 +49,14 @@ pub fn compile_skip(match_skip: &str, word: &str) -> SkipKind {
                 word: word.to_string(),
                 ignorecase: true,
                 captures: false,
+                scan: false,
             },
         ) {
             if t.prefix_checks.is_empty() {
                 if let Ok(re) = Regex::new(&t.pattern) {
                     return if syntax {
-                        SkipKind::Syn { re, invert }
+                        let empty = re.is_match("").unwrap_or(false) != invert;
+                        SkipKind::Syn { re, invert, empty }
                     } else {
                         SkipKind::Prefix { re, invert }
                     };
@@ -132,13 +140,25 @@ pub fn syn_name(lnum: usize, cnum: usize, translate_id: bool) -> String {
 /// Evaluate the skip expression at (lnum, cnum); `line` is the text of
 /// lnum. Returns the raw expression value; the caller applies
 /// invert_skip (XOR), mirroring matchup#delim#skip (delim.vim:868).
-pub fn skip_at(kind: &SkipKind, line: &str, lnum: usize, cnum: usize) -> bool {
+pub fn skip_at(
+    kind: &SkipKind,
+    line: &str,
+    lnum: usize,
+    cnum: usize,
+    syntax_on: bool,
+) -> bool {
     match kind {
         SkipKind::Default => {
+            if !syntax_on {
+                return RE_COMMENT_STRING.is_match("").unwrap_or(false);
+            }
             let name = syn_name(lnum, cnum, true);
             RE_COMMENT_STRING.is_match(&name).unwrap_or(false)
         }
-        SkipKind::Syn { re, invert } => {
+        SkipKind::Syn { re, invert, empty } => {
+            if !syntax_on {
+                return *empty;
+            }
             let name = syn_name(lnum, cnum, true);
             re.is_match(&name).unwrap_or(false) != *invert
         }
@@ -150,13 +170,13 @@ pub fn skip_at(kind: &SkipKind, line: &str, lnum: usize, cnum: usize) -> bool {
             re.is_match(&line[..end]).unwrap_or(false) != *invert
         }
         SkipKind::Raw { expr } => {
-            // nvim_call_function is ABI-broken on nvim 0.13-dev; pass the
-            // expression through a global variable and use eval.
-            let _ = api::set_var("matchup_rs_skip_expr", expr.clone());
-            let r: i64 = api::eval(&format!(
-                "matchup#rs#skip_eval(g:matchup_rs_skip_expr, {lnum}, {cnum})"
-            ))
-            .unwrap_or(0);
+            // nvim_call_function is ABI-broken on nvim 0.13-dev; inline the
+            // expression as a single-quoted vimscript literal (fully literal,
+            // quotes doubled) in one eval round-trip.
+            let q = crate::motion::vim_quote(expr);
+            let r: i64 =
+                api::eval(&format!("matchup#rs#skip_eval({q}, {lnum}, {cnum})"))
+                    .unwrap_or(0);
             r != 0
         }
     }
@@ -182,6 +202,7 @@ impl MidSkip {
                 word: word_class.to_string(),
                 ignorecase: false,
                 captures: false,
+                scan: false,
             },
         )
         .ok()?;
@@ -191,6 +212,7 @@ impl MidSkip {
                 word: word_class.to_string(),
                 ignorecase: false,
                 captures: false,
+                scan: false,
             },
         )
         .ok()?;
@@ -210,6 +232,7 @@ impl MidSkip {
                 word: word_class.to_string(),
                 ignorecase: false,
                 captures: false,
+                scan: false,
             },
         )
         .ok()?;
@@ -257,6 +280,7 @@ pub fn in_synstack(pat: &str, lnum: usize, cnum: usize, word: &str) -> bool {
             word: word.to_string(),
             ignorecase: false,
             captures: false,
+            scan: false,
         },
     )
     .ok()
