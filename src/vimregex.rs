@@ -232,18 +232,6 @@ impl Parser {
         self.i += n;
     }
 
-    /// True when the char at `self.i` is not preceded by an odd number of
-    /// backslashes (vim's `not_bslash` condition).
-    fn not_bslash(&self) -> bool {
-        let mut n = 0;
-        let mut j = self.i;
-        while j > 0 && self.cs[j - 1] == '\\' {
-            n += 1;
-            j -= 1;
-        }
-        n % 2 == 0
-    }
-
     fn parse_alt(&mut self) -> Result<Node> {
         let mut branches = vec![self.parse_concat()?];
         while self.starts(r"\|") && self.not_bslash_at(self.i) {

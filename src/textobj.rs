@@ -1,0 +1,560 @@
+//! Text objects: i% and a%.
+//! Port of autoload/matchup/text_obj.vim.
+
+use std::rc::Rc;
+
+use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
+use nvim_oxi::Function;
+
+use crate::engine::{self, Ctx, SurroundOpts};
+use crate::state::State;
+use crate::types::{pos_next, pos_prev, Delim, Pos};
+
+type SharedState = Rc<State>;
+
+fn normal(cmd: &str) {
+    let _ = api::command(&format!("normal! {cmd}"));
+}
+
+fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
+    let mut cnum = p.cnum;
+    if let Some(line) = ctx.lines.get1(p.lnum) {
+        if cnum > line.len() + 1 {
+            cnum = line.len() + 1;
+        }
+        let mut c0 = cnum - 1;
+        while c0 > 0 && !line.is_char_boundary(c0) {
+            c0 -= 1;
+        }
+        cnum = c0 + 1;
+    }
+    let _ = win.set_cursor(p.lnum.saturating_sub(1), cnum.saturating_sub(1));
+}
+
+fn motion_force() -> String {
+    let mode: String = api::eval("mode(1)").unwrap_or_default();
+    if mode.len() >= 3 && mode.starts_with("no") {
+        mode[2..3].to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn obj_str(o: Option<&nvim_oxi::Object>) -> String {
+    use nvim_oxi::conversion::FromObject;
+    o.cloned()
+        .and_then(|o| String::from_object(o).ok())
+        .unwrap_or_default()
+}
+
+fn in_indent(ctx: &Ctx, p: Pos) -> bool {
+    if p.cnum == 0 {
+        return false;
+    }
+    let line = ctx.lines.get1(p.lnum).unwrap_or("");
+    let mut e = p.cnum.min(line.len());
+    while e > 0 && !line.is_char_boundary(e) {
+        e -= 1;
+    }
+    line[..e].chars().all(|c| c.is_whitespace())
+}
+
+fn pos_next_eol(ctx: &Ctx, p: Pos) -> Pos {
+    let line = ctx.lines.get1(p.lnum).unwrap_or("");
+    if p.cnum > line.len() {
+        return Pos::new(p.lnum + 1, 1);
+    }
+    let next = pos_next(line, p);
+    if next.lnum > p.lnum {
+        Pos::new(p.lnum, p.cnum + 1)
+    } else {
+        next
+    }
+}
+
+/// Port of matchup#util#matchpref: g:matchup_matchpref[&ft][id].
+fn matchpref(id: &str, default: bool) -> bool {
+    use nvim_oxi::conversion::FromObject;
+    let ft: String = api::eval("&filetype").unwrap_or_default();
+    let d: nvim_oxi::Dictionary = api::get_var("matchup_matchpref").unwrap_or_default();
+    if let Some(ftd) = d.get(ft.as_str()) {
+        if let Ok(dict) = nvim_oxi::Dictionary::from_object(ftd.clone()) {
+            if let Some(v) = dict.get(id) {
+                if let Ok(b) = i64::try_from(v.clone()) {
+                    return b != 0;
+                }
+            }
+        }
+    }
+    default
+}
+
+fn ishtmllike() -> bool {
+    let ft: String = api::eval("&filetype").unwrap_or_default();
+    let first = ft.split('.').next().unwrap_or("");
+    matches!(
+        first,
+        "tidy"
+            | "php"
+            | "liquid"
+            | "haml"
+            | "tt2html"
+            | "html"
+            | "xhtml"
+            | "xml"
+            | "jsp"
+            | "htmldjango"
+            | "aspvbs"
+            | "rmd"
+            | "markdown"
+            | "eruby"
+            | "vue"
+            | "javascriptreact"
+            | "typescriptreact"
+            | "svelte"
+            | "templ"
+    )
+}
+
+/// Port of matchup#text_obj#delimited (text_obj.vim:10).
+pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
+    let v_motion_force = motion_force();
+
+    let vars: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
+        "[v:count, v:count1, v:operator, v:register, &selection, visualmode(), getpos(\"'<\")[1:2], getpos(\"'>\")[1:2]]",
+    )
+    .map(|a| a.into_iter().collect())
+    .unwrap_or_default();
+    let gi = |i: usize| -> i64 {
+        vars.get(i)
+            .cloned()
+            .and_then(|o| i64::try_from(o).ok())
+            .unwrap_or(0)
+    };
+    let count = gi(0);
+    let count1 = gi(1).max(1);
+    let operator = obj_str(vars.get(2));
+    let save_reg = obj_str(vars.get(3));
+    let selection_opt = obj_str(vars.get(4));
+    let visualmode = obj_str(vars.get(5));
+    let sel_start = Pos::new(gi(6) as usize, gi(7) as usize);
+    let sel_end = Pos::new(gi(8) as usize, gi(9) as usize);
+
+    let mut win = ctx.win.clone();
+
+    // move to the start of the current selection
+    if visual {
+        set_cursor(&mut win, ctx, sel_start);
+    }
+
+    let mut forced = if visual {
+        String::new()
+    } else {
+        v_motion_force.clone()
+    };
+
+    // determine if operator is able to act line-wise (for inner)
+    let mut linewise_op = ctx
+        .gopts
+        .text_obj_linewise_operators
+        .iter()
+        .any(|o| *o == operator);
+    if operator == "g@" {
+        // '^g@\%(,\(.\+\)\)\?' spec against the joined option string
+        let spec: String = ctx.gopts.text_obj_linewise_operators.join(",");
+        if let Some(rest) = spec.strip_prefix("g@") {
+            if rest.is_empty() {
+                linewise_op = true;
+            } else if let Some(expr) = rest.strip_prefix(',') {
+                linewise_op = api::eval::<i64>(expr).unwrap_or(0) != 0;
+            }
+        }
+    } else if operator == ":"
+        && ctx
+            .gopts
+            .text_obj_linewise_operators
+            .iter()
+            .any(|o| *o == visualmode)
+    {
+        linewise_op = true;
+    }
+
+    ctx.state.perf.timeout_start(725.0);
+
+    // the [local, try_again] schedule
+    let simple = count == 1 || count > ctx.gopts.delim_count_max as i64;
+    let schedule: Vec<(bool, i64)> = if simple {
+        if is_inner {
+            vec![(false, 0), (false, 1), (false, 2), (false, 3)]
+        } else {
+            vec![(false, 0), (false, 1), (false, 2)]
+        }
+    } else if is_inner {
+        vec![
+            (true, 0),
+            (false, 0),
+            (true, 1),
+            (false, 1),
+            (true, 2),
+            (false, 2),
+        ]
+    } else {
+        vec![(true, 0), (false, 0), (true, 1), (false, 1)]
+    };
+
+    let mut l1: usize = 0;
+    let mut c1: usize = 0;
+    let mut l2: usize = 0;
+    let mut c2: usize = 0;
+    let mut completed = false;
+
+    for (local, try_again) in schedule {
+        let cnt = (count1 + try_again).max(0) as usize;
+        let opts = SurroundOpts {
+            local: Some(false),
+            stopline: 0,
+            check_skip: false,
+            highlighting: false,
+        };
+        let (_open, close_, ml) = match engine::get_surrounding(ctx, cnt, &opts) {
+            Some(r) => r,
+            None => {
+                if visual {
+                    normal("gv");
+                } else {
+                    // invalid text object: drop into normal mode and undo
+                    // any entered text (text_obj.vim:66-74)
+                    let keys = nvim_oxi::String::from("\u{1c}\u{1e}\u{1b}");
+                    let mode = nvim_oxi::String::from("n");
+                    api::feedkeys(&keys, &mode, false);
+                    let seq: i64 = api::eval("undotree().seq_cur").unwrap_or(0);
+                    let keys = nvim_oxi::String::from(format!(
+                        ":call matchup#rs#text_obj_undo({seq})\r:\u{3}",
+                        seq = seq
+                    ));
+                    let mode = nvim_oxi::String::from("n");
+                    api::feedkeys(&keys, &mode, false);
+                }
+                return;
+            }
+        };
+        let _ = close_;
+
+        let seed_idx = ml
+            .delims
+            .iter()
+            .position(|d| d.word_id != crate::types::MID_SENTINEL)
+            .unwrap_or(0);
+
+        let (open, close): (Delim, Delim) = if local {
+            let cur = ctx.cursor().unwrap_or(sel_start);
+            match engine::get_surround_nearest(&ml, seed_idx, cur) {
+                Some((pi, ni)) => (ml.delims[pi].clone(), ml.delims[ni].clone()),
+                None => (
+                    ml.delims[seed_idx].clone(),
+                    ml.delims[ml.next_of(seed_idx)].clone(),
+                ),
+            }
+        } else {
+            (ml.delims[seed_idx].clone(), ml.close().clone())
+        };
+
+        // no way to specify an empty region: use tricks (text_obj.vim:88)
+        let mut epos = Pos::new(open.lnum, open.cnum + open.end_offset());
+        {
+            let line = ctx.lines.get1(epos.lnum).unwrap_or("");
+            epos = pos_next(line, epos);
+        }
+        if !visual && is_inner && close.pos() == epos {
+            if operator == "c" {
+                set_cursor(&mut win, ctx, close.pos());
+                let _ = api::command("silent! execute \"normal! i \\<esc>v\"");
+            } else if !"<>".contains(&operator) {
+                let byte: i64 = api::eval(&format!(
+                    "line2byte({}) + {} - 1",
+                    close.lnum, close.cnum
+                ))
+                .unwrap_or(0);
+                let keys = nvim_oxi::String::from(format!("{byte}go"));
+                let mode = nvim_oxi::String::from("n");
+                api::feedkeys(&keys, &mode, false);
+            }
+            return;
+        }
+
+        l1 = open.lnum;
+        c1 = open.cnum;
+        l2 = close.lnum;
+        c2 = close.cnum;
+
+        let line_count = l2.saturating_sub(l1) + 1;
+
+        // if inner and the selection coincides with open/close, try again
+        if visual
+            && is_inner
+            && sel_start == Pos::new(l1, c1)
+            && sel_end == Pos::new(l2, c2)
+        {
+            continue;
+        }
+
+        if is_inner {
+            c1 += open.end_offset();
+            {
+                let line = ctx.lines.get1(l1).unwrap_or("");
+                let p = pos_next(line, Pos::new(l1, c1));
+                l1 = p.lnum;
+                c1 = p.cnum;
+            }
+            let mut sol = c2 <= 1;
+            {
+                let line = ctx.lines.get1(l2).unwrap_or("");
+                let pline = ctx.lines.get1(l2.saturating_sub(1)).unwrap_or("");
+                let p = pos_prev(line, pline, Pos::new(l2, c2));
+                l2 = p.lnum;
+                c2 = p.cnum;
+            }
+
+            // make *i% more like *it for html
+            if line_count < 2
+                && ishtmllike()
+                && !matchpref("classic_textobj", false)
+                && html_close_like(&close.match_)
+                && !(visual && Pos::new(l1, c1) == Pos::new(l2, c2))
+            {
+                let line = ctx.lines.get1(l2).unwrap_or("");
+                let pline = ctx.lines.get1(l2.saturating_sub(1)).unwrap_or("");
+                let p = pos_prev(line, pline, Pos::new(l2, c2));
+                l2 = p.lnum;
+                c2 = p.cnum;
+                if !open.match_.to_lowercase().ends_with('>') {
+                    let line = ctx.lines.get1(l1).unwrap_or("");
+                    let p = pos_next(line, Pos::new(l1, c1));
+                    l1 = p.lnum;
+                    c1 = p.cnum;
+                }
+            }
+
+            // don't select only indent at close
+            while in_indent(ctx, Pos::new(l2, c2)) {
+                c2 = 1;
+                let line = ctx.lines.get1(l2).unwrap_or("");
+                let pline = ctx.lines.get1(l2.saturating_sub(1)).unwrap_or("");
+                let p = pos_prev(line, pline, Pos::new(l2, c2));
+                l2 = p.lnum;
+                c2 = p.cnum;
+                sol = true;
+            }
+
+            // include the line break if we had wrapped around
+            if visual && sol {
+                c2 = ctx.lines.get1(l2).map(|l| l.len()).unwrap_or(0) + 1;
+            }
+
+            if !visual {
+                if sol {
+                    let line = ctx.lines.get1(l2).unwrap_or("");
+                    let p = pos_next(line, Pos::new(l2, c2));
+                    l2 = p.lnum;
+                    c2 = p.cnum;
+                }
+
+                // toggle exclusive: difference between di% and dvi%
+                let mut inclusive =
+                    !sol && Pos::new(l1, c1).val() <= Pos::new(l2, c2).val();
+                if forced == "v" {
+                    inclusive = !inclusive;
+                }
+
+                // sometimes operate in visual line motion (re-purpose force)
+                if v_motion_force.is_empty() && c2 <= 1 && line_count > 1 && !inclusive {
+                    l2 -= 1;
+                    if c1 <= 1 || in_indent(ctx, Pos::new(l1, c1.saturating_sub(1))) {
+                        forced = "V".to_string();
+                        inclusive = true;
+                    } else {
+                        // end_adjusted
+                        c2 = ctx.lines.get1(l2).map(|l| l.len()).unwrap_or(0) + 1;
+                        if c2 > 1 {
+                            c2 -= 1;
+                            inclusive = true;
+                        }
+                    }
+                }
+
+                if !inclusive {
+                    let line = ctx.lines.get1(l2).unwrap_or("");
+                    let pline = ctx.lines.get1(l2.saturating_sub(1)).unwrap_or("");
+                    let p = pos_prev(line, pline, Pos::new(l2, c2));
+                    l2 = p.lnum;
+                    c2 = p.cnum;
+                }
+            }
+
+            // line-wise special case
+            if line_count > 2 && linewise_op && close.match_.len() > 1 {
+                if c1 != 1 {
+                    l1 += 1;
+                    c1 = 1;
+                }
+                l2 = close.lnum - 1;
+                c2 = ctx.lines.get1(l2).map(|l| l.len()).unwrap_or(0) + 1;
+            }
+
+            // empty selection fallback
+            if !visual && (l2 < l1 || (l1 == l2 && c1 > c2)) {
+                if operator == "c" {
+                    set_cursor(&mut win, ctx, Pos::new(l1, c1));
+                    let _ = api::command("silent! execute \"normal! i \\<esc>v\"");
+                } else if !"<>".contains(&operator) {
+                    let byte: i64 =
+                        api::eval(&format!("line2byte({l1}) + {c1} - 1")).unwrap_or(0);
+                    let keys = nvim_oxi::String::from(format!("{byte}go"));
+                    let mode = nvim_oxi::String::from("n");
+                    api::feedkeys(&keys, &mode, false);
+                }
+                return;
+            }
+        } else {
+            c2 += close.end_offset();
+
+            // make *a% more like *at for html
+            if ishtmllike() && !matchpref("classic_textobj", false) && html_close_like(&close.match_)
+            {
+                c1 = c1.saturating_sub(1);
+                if !close.match_.to_lowercase().ends_with('>') {
+                    c2 += 1;
+                }
+            }
+
+            // special case for delete operator
+            if !visual && operator == "d" && line_count > 1 {
+                let line2 = ctx.lines.get1(l2).unwrap_or("");
+                let after = &line2[c2.min(line2.len())..];
+                let before = &line2[..(c1 - 1).min(line2.len())];
+                if after.chars().all(|c| c.is_whitespace())
+                    && before.chars().all(|c| c.is_whitespace())
+                {
+                    c1 = 1;
+                    c2 = line2.len() + 1;
+                }
+            }
+        }
+
+        // in visual line mode, force new selection to not be smaller
+        if visual && visualmode == "V" && (l1 > sel_start.lnum || l2 < sel_end.lnum) {
+            continue;
+        }
+
+        // in other visual modes, try again if we didn't reach a bigger range
+        if visual
+            && visualmode != "V"
+            && sel_start != sel_end
+            && ((sel_start == Pos::new(l1, c1) && sel_end == Pos::new(l2, c2))
+                || Pos::new(l1, c1).larger(&sel_start)
+                || sel_end.larger(&Pos::new(l2, c2)))
+        {
+            continue;
+        }
+
+        completed = true;
+        break;
+    }
+
+    let _ = completed;
+    if l1 == 0 {
+        return;
+    }
+
+    // set the proper visual mode for this selection
+    let select_mode = if operator == ":" {
+        visualmode.clone()
+    } else if !forced.is_empty() {
+        forced.clone()
+    } else {
+        "v".to_string()
+    };
+
+    if selection_opt == "exclusive" {
+        let p = pos_next_eol(ctx, Pos::new(l2, c2));
+        l2 = p.lnum;
+        c2 = p.cnum;
+    }
+
+    // apply selection
+    normal(&select_mode);
+    normal("o");
+    set_cursor(&mut win, ctx, Pos::new(l1, c1));
+    normal("o");
+    set_cursor(&mut win, ctx, Pos::new(l2, c2));
+    if operator == "g@" && !save_reg.is_empty() {
+        normal(&format!("\"{save_reg}"));
+    }
+}
+
+/// close.match =~? '^/\w\+\s*>\=$'
+fn html_close_like(m: &str) -> bool {
+    let b = m.as_bytes();
+    if b.first() != Some(&b'/') {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if i == 1 {
+        return false;
+    }
+    let tail = &m[i..];
+    let t = tail.trim_start_matches(|c: char| c.is_whitespace());
+    t.is_empty() || t == ">"
+}
+
+// ---------------------------------------------------------------------------
+// keymaps
+// ---------------------------------------------------------------------------
+
+pub fn setup(state: &SharedState) {
+    let enabled: i64 = api::get_var("matchup_text_obj_enabled").unwrap_or(1);
+    let mappings_enabled: i64 = api::get_var("matchup_mappings_enabled").unwrap_or(1);
+    if enabled == 0 || mappings_enabled == 0 {
+        return;
+    }
+
+    for (lhs, inner) in [("i%", true), ("a%", false)] {
+        for (mode, mode_s, visual) in [
+            (Mode::Visual, "x", true),
+            (Mode::OperatorPending, "o", false),
+        ] {
+            let s = Rc::clone(state);
+            let i = inner;
+            let v = visual;
+            let cb = Function::from_fn(move |()| {
+                crate::with_ctx(&s, |ctx| delimited(ctx, i, v));
+            });
+            let opts = SetKeymapOpts::builder()
+                .noremap(true)
+                .silent(true)
+                .callback(cb)
+                .build();
+            let plug = format!("<Plug>(matchup-{lhs})");
+            let _ = api::set_keymap(mode, &plug, "", &opts);
+            // guarded default mapping
+            let unmapped: String = api::eval(&format!(
+                "maparg({}, {})",
+                crate::motion::vim_quote(lhs),
+                crate::motion::vim_quote(mode_s)
+            ))
+            .unwrap_or_default();
+            let has: i64 = api::eval(&format!(
+                "hasmapto({}, {})",
+                crate::motion::vim_quote(&plug),
+                crate::motion::vim_quote(mode_s)
+            ))
+            .unwrap_or(0);
+            if unmapped.is_empty() && has == 0 {
+                let _ = api::set_keymap(mode, lhs, "", &opts);
+            }
+        }
+    }
+}
