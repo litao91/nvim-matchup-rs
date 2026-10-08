@@ -35,7 +35,15 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
         }
         cnum = c0 + 1;
     }
-    let _ = win.set_cursor(p.lnum.saturating_sub(1), cnum.saturating_sub(1));
+    // nvim_win_set_cursor: line is 1-based, col is 0-based
+    let r = win.set_cursor(p.lnum, cnum.saturating_sub(1));
+    crate::matchparen::trace(&format!(
+        "set_cursor({},{}) -> {:?} now {:?}",
+        p.lnum,
+        cnum,
+        r.as_ref().err().map(|e| format!("{e:?}")),
+        win.get_cursor()
+    ));
 }
 
 fn eval_str(expr: &str) -> String {
@@ -52,6 +60,7 @@ fn motion_force() -> String {
     }
 }
 
+#[derive(Debug)]
 struct Vars {
     count: i64,
     count1: i64,
@@ -63,8 +72,8 @@ struct Vars {
     startofline: bool,
 }
 
-fn read_vars() -> Vars {
-    let vals: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
+fn read_vars(ctx: &Ctx) -> Vars {
+    let mut vals: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
         "[v:count, v:count1, v:operator, v:register, &selection, visualmode(), &foldopen, &startofline]",
     )
     .map(|a| a.into_iter().collect())
@@ -82,10 +91,13 @@ fn read_vars() -> Vars {
             .and_then(|o| String::from_object(o).ok())
             .unwrap_or_default()
     };
+    // during the op() re-feed, v:operator may be cleared; use the stash
+    let stashed = ctx.state.op_operator.borrow().clone();
+    let operator = if stashed.is_empty() { gs(2) } else { stashed };
     Vars {
         count: gi(0),
         count1: gi(1).max(1),
-        operator: gs(2),
+        operator,
         register: gs(3),
         selection: gs(4),
         visualmode: gs(5),
@@ -166,8 +178,10 @@ fn seed_index(ml: &MatchingList) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Port of matchup#motion#find_matching_pair (motion.vim:24).
-pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
-    let vars = read_vars();
+pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
+    use crate::matchparen::trace;
+    let vars = read_vars(ctx);
+    trace(&format!("FMP start visual={visual} down={down} count={} count1={} op={vars:?} cursor={:?}", vars.count, vars.count1, ctx.cursor()));
     let force = motion_force();
     let is_oper = !vars.operator.is_empty();
 
@@ -183,7 +197,7 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
             normal("V");
         }
         let _ = api::command(&format!("normal! {}%", vars.count));
-        return;
+        return true;
     }
 
     if in_indentexpr() {
@@ -200,13 +214,15 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
     let mut delim = match engine::get_delim(ctx, &o) {
         Some(d) => d,
         None => {
+            trace("FMP current empty, trying next");
             o = GetDelimOpts::new(Direction::Next, SideQuery::BothAll);
             match engine::get_delim(ctx, &o) {
                 Some(d) => d,
-                None => return,
+                None => { trace("FMP no delim at all"); return false; }
             }
         }
     };
+    trace(&format!("FMP delim {} {} {:?} side={:?}", delim.lnum, delim.cnum, delim.match_, delim.side));
 
     let ml = engine::get_matching(
         ctx,
@@ -221,17 +237,21 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
     } else {
         2
     };
+    trace(&format!("FMP ml len {}", ml.len()));
     if ml.len() < min_len {
-        return;
+        trace("FMP ml too short");
+        return false;
     }
 
     // walk links count1 times
     let mut idx = seed_index(&ml);
+    trace(&format!("FMP seed_idx {idx}"));
     delim.match_index = ml.delims[idx].match_index;
     for _ in 0..vars.count1 {
         idx = if down { ml.next_of(idx) } else { ml.prev_of(idx) };
     }
     let target: Delim = ml.delims[idx].clone();
+    trace(&format!("FMP target {} {} {:?} side={:?} idx={idx}", target.lnum, target.cnum, target.match_, target.side));
 
     if visual && is_oper {
         ensure_visual();
@@ -249,7 +269,7 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
 
     let start_pos = match ctx.cursor() {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     if !ctx.gopts.motion_keepjumps {
@@ -329,11 +349,15 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
         normal("o");
     }
 
+    trace(&format!("FMP set_cursor ({lnum},{column})"));
     set_cursor(&mut win, ctx, Pos::new(lnum, column));
+    trace(&format!("FMP after set_cursor: {:?}", ctx.cursor()));
 
     if vars.foldopen.contains("percent") {
         normal("zv");
+        trace(&format!("FMP after zv: {:?}", ctx.cursor()));
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -341,9 +365,9 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) {
 // ---------------------------------------------------------------------------
 
 /// Port of matchup#motion#find_unmatched (motion.vim:164).
-pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) {
+pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) -> bool {
     ctx.state.perf.tic("motion#find_unmatched");
-    let vars = read_vars();
+    let vars = read_vars(ctx);
     let force = motion_force();
     let is_oper = !vars.operator.is_empty();
     let exclusive = is_oper && force != "v" && force != "\x16";
@@ -373,14 +397,14 @@ pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) {
                 ctx.state
                     .perf
                     .toc("motion#find_unmatched", &format!("fail{tries}"));
-                return;
+                return false;
             }
         };
 
         let delim = if down { close } else { open };
         let save_pos = match ctx.cursor() {
             Some(p) => p,
-            None => return,
+            None => return false,
         };
         let mut np = Pos::new(delim.lnum, delim.cnum);
 
@@ -413,11 +437,11 @@ pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) {
 
     let mut new_pos = match new_pos {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
     let delim = match found_delim {
         Some(d) => d,
-        None => return,
+        None => return false,
     };
 
     let mut win = ctx.win.clone();
@@ -457,6 +481,7 @@ pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) {
     set_cursor(&mut win, ctx, new_pos);
 
     ctx.state.perf.toc("motion#find_unmatched", "done");
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -464,12 +489,12 @@ pub fn find_unmatched(ctx: &Ctx, visual: bool, down: bool, timeout: f64) {
 // ---------------------------------------------------------------------------
 
 /// Port of matchup#motion#jump_inside (motion.vim:254).
-pub fn jump_inside(ctx: &Ctx, visual: bool) {
-    let vars = read_vars();
+pub fn jump_inside(ctx: &Ctx, visual: bool) -> bool {
+    let vars = read_vars(ctx);
     let force = motion_force();
     let save_pos = match ctx.cursor() {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     ctx.state.perf.timeout_start(750.0);
@@ -498,7 +523,7 @@ pub fn jump_inside(ctx: &Ctx, visual: bool) {
             None => {
                 let mut win = ctx.win.clone();
                 set_cursor(&mut win, ctx, save_pos);
-                return;
+                return false;
             }
         };
         let mut np = Pos::new(delim.lnum, delim.cnum + delim.end_offset());
@@ -512,7 +537,7 @@ pub fn jump_inside(ctx: &Ctx, visual: bool) {
 
     let mut new_pos = match new_pos {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     // exclusive motion except when dealing with whitespace
@@ -550,14 +575,15 @@ pub fn jump_inside(ctx: &Ctx, visual: bool) {
         normal("m`");
     }
     set_cursor(&mut win, ctx, new_pos);
+    true
 }
 
 /// Port of matchup#motion#jump_inside_prev (motion.vim:317).
-pub fn jump_inside_prev(ctx: &Ctx, visual: bool) {
-    let vars = read_vars();
+pub fn jump_inside_prev(ctx: &Ctx, visual: bool) -> bool {
+    let vars = read_vars(ctx);
     let save_pos = match ctx.cursor() {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     ctx.state.perf.timeout_start(750.0);
@@ -584,7 +610,7 @@ pub fn jump_inside_prev(ctx: &Ctx, visual: bool) {
                 None => {
                     let mut win = ctx.win.clone();
                     set_cursor(&mut win, ctx, save_pos);
-                    return;
+                    return false;
                 }
             };
             let mut np = Pos::new(delim.lnum, delim.cnum + delim.end_offset());
@@ -617,7 +643,7 @@ pub fn jump_inside_prev(ctx: &Ctx, visual: bool) {
 
     let mut new_pos = match new_pos {
         Some(p) => p,
-        None => return,
+        None => return false,
     };
 
     let is_oper = !vars.operator.is_empty();
@@ -629,6 +655,7 @@ pub fn jump_inside_prev(ctx: &Ctx, visual: bool) {
         normal("m`");
     }
     set_cursor(&mut win, ctx, new_pos);
+    true
 }
 
 /// Port of matchup#motion#insert_mode (motion.vim:376).
@@ -693,109 +720,140 @@ fn lhs_free(lhs: &str, mode: &str) -> bool {
     unmapped.is_empty() && has == 0
 }
 
-fn map(
-    mode: Mode,
-    mode_s: &str,
-    lhs: &str,
-    state: &SharedState,
-    f: impl Fn(&Ctx) + 'static,
-) {
-    let s = Rc::clone(state);
-    let cb = Function::from_fn(move |()| {
-        crate::with_ctx(&s, |ctx| f(ctx));
-    });
+/// Operator-pending entry (port of matchup#motion#op, motion.vim:11).
+/// First invocation stashes v:operator and re-feeds
+/// `{wise}{count}<Plug>(plug)`; the re-entrant invocation (in_op set)
+/// performs the actual motion so vim resolves the pending operator from
+/// the cursor displacement with the forced motion type.
+pub fn op_motion(ctx: &Ctx, plug: &str) {
+    if ctx.state.in_op.get() {
+        match plug {
+            "matchup-%" => {
+                find_matching_pair(ctx, false, true);
+            }
+            "matchup-g%" => {
+                find_matching_pair(ctx, false, false);
+            }
+            "matchup-]%" => {
+                find_unmatched(ctx, false, true, 750.0);
+            }
+            "matchup-[%" => {
+                find_unmatched(ctx, false, false, 750.0);
+            }
+            "matchup-z%" => {
+                jump_inside(ctx, false);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let force = motion_force();
+    let operator = eval_str("v:operator");
+    *ctx.state.op_operator.borrow_mut() = operator;
+
+    let wise = if force.is_empty() { "v" } else { force.as_str() };
+    let count: i64 = api::eval("v:count").unwrap_or(0);
+    let _ = api::set_var(
+        "mrs_op_args",
+        nvim_oxi::Array::from_iter([
+            nvim_oxi::Object::from(wise),
+            nvim_oxi::Object::from(count),
+            nvim_oxi::Object::from(plug),
+        ]),
+    );
+    ctx.state.in_op.set(true);
+    let _ = api::eval::<i64>("matchup#rs#op_exec()");
+    ctx.state.in_op.set(false);
+    *ctx.state.op_operator.borrow_mut() = String::new();
+}
+
+fn map_rhs(mode: Mode, mode_s: &str, plug_suffix: &str, rhs: &str, default_lhs: Option<&str>) {
     let opts = SetKeymapOpts::builder()
         .noremap(true)
         .silent(true)
-        .callback(cb)
         .build();
-    // <Plug> mapping (always)
-    let plug = format!("<Plug>(matchup-{lhs})");
-    let _ = api::set_keymap(mode, &plug, "", &opts);
-    // default mapping (guarded)
-    if lhs_free(lhs, mode_s) {
-        let _ = api::set_keymap(mode, lhs, "", &opts);
+    let plug = format!("<Plug>(matchup-{plug_suffix})");
+    let _ = api::set_keymap(mode, &plug, rhs, &opts);
+    if let Some(lhs) = default_lhs {
+        if lhs_free(lhs, mode_s) {
+            let _ = api::set_keymap(mode, lhs, rhs, &opts);
+        }
     }
 }
 
-pub fn setup(state: &SharedState) {
+pub fn setup(_state: &SharedState) {
     let motion_enabled: i64 = api::get_var("matchup_motion_enabled").unwrap_or(1);
     let mappings_enabled: i64 = api::get_var("matchup_mappings_enabled").unwrap_or(1);
     if motion_enabled == 0 || mappings_enabled == 0 {
         return;
     }
 
-    // % (down) and g% (up)
-    for (lhs, down) in [("%", true), ("g%", false)] {
-        let d = down;
-        map(Mode::Normal, "n", lhs, state, move |ctx| {
-            find_matching_pair(ctx, false, d)
-        });
-        let d = down;
-        map(Mode::Visual, "x", lhs, state, move |ctx| {
-            find_matching_pair(ctx, true, d)
-        });
-        let d = down;
-        map(Mode::OperatorPending, "o", lhs, state, move |ctx| {
-            find_matching_pair(ctx, false, d)
-        });
+    // NOTE: rhs strings use <cmd> (no mode transition); LuaRef callbacks
+    // are broken on nvim 0.13-dev (registered but never invoked).
+
+    // % and g%
+    for (suffix, down) in [("%", 1), ("g%", 0)] {
+        let n_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(0,{down})<cr>");
+        let x_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(1,{down})<cr>");
+        let o_rhs = format!(
+            "<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>"
+        );
+        map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
+        map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
+        map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));
     }
 
     // ]% and [%
-    for (lhs, down) in [("]%", true), ("[%", false)] {
-        let d = down;
-        map(Mode::Normal, "n", lhs, state, move |ctx| {
-            find_unmatched(ctx, false, d, 750.0)
-        });
-        let d = down;
-        map(Mode::Visual, "x", lhs, state, move |ctx| {
-            find_unmatched(ctx, true, d, 750.0)
-        });
-        let d = down;
-        map(Mode::OperatorPending, "o", lhs, state, move |ctx| {
-            find_unmatched(ctx, false, d, 750.0)
-        });
+    for (suffix, down) in [("]%", 1), ("[%", 0)] {
+        let n_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(0,{down})<cr>");
+        let x_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(1,{down})<cr>");
+        let o_rhs = format!(
+            "<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>"
+        );
+        map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
+        map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
+        map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));
     }
 
     // z%
-    map(Mode::Normal, "n", "z%", state, |ctx| {
-        jump_inside(ctx, false)
-    });
-    map(Mode::Visual, "x", "z%", state, |ctx| {
-        jump_inside(ctx, true)
-    });
-    map(Mode::OperatorPending, "o", "z%", state, |ctx| {
-        jump_inside(ctx, false)
-    });
+    map_rhs(
+        Mode::Normal,
+        "n",
+        "z%",
+        "<cmd>lua require('matchup_rs').motion_jump_inside(0)<cr>",
+        Some("z%"),
+    );
+    map_rhs(
+        Mode::Visual,
+        "x",
+        "z%",
+        "<cmd>lua require('matchup_rs').motion_jump_inside(1)<cr>",
+        Some("z%"),
+    );
+    map_rhs(
+        Mode::OperatorPending,
+        "o",
+        "z%",
+        "<cmd>lua require('matchup_rs').op_motion('matchup-z%')<cr>",
+        Some("z%"),
+    );
 
-    // Z% (unmapped <Plug> only, like the original)
-    {
-        let s = Rc::clone(state);
-        let cb = Function::from_fn(move |()| {
-            crate::with_ctx(&s, |ctx| jump_inside_prev(ctx, false));
-        });
-        let opts = SetKeymapOpts::builder()
-            .noremap(true)
-            .silent(true)
-            .callback(cb)
-            .build();
-        let _ = api::set_keymap(Mode::Normal, "<Plug>(matchup-Z%)", "", &opts);
-    }
+    // Z% (<Plug> only, like the original)
+    map_rhs(
+        Mode::Normal,
+        "n",
+        "Z%",
+        "<cmd>lua require('matchup_rs').motion_jump_inside_prev(0)<cr>",
+        None,
+    );
 
     // insert mode <c-g>%
-    {
-        let s = Rc::clone(state);
-        let cb = Function::from_fn(move |()| {
-            crate::with_ctx(&s, |ctx| insert_mode(ctx));
-        });
-        let opts = SetKeymapOpts::builder()
-            .noremap(true)
-            .silent(true)
-            .callback(cb)
-            .build();
-        let _ = api::set_keymap(Mode::Insert, "<Plug>(matchup-c_g%)", "", &opts);
-        if lhs_free("<c-g>%", "i") {
-            let _ = api::set_keymap(Mode::Insert, "<C-G>%", "", &opts);
-        }
-    }
+    map_rhs(
+        Mode::Insert,
+        "i",
+        "c_g%",
+        "<cmd>lua require('matchup_rs').motion_insert()<cr>",
+        Some("<c-g>%"),
+    );
 }

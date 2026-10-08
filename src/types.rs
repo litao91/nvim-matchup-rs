@@ -143,6 +143,16 @@ impl MatchingList {
         self.delims.last().unwrap()
     }
 
+    /// Index of the seed delim's entry: list entries built from scan
+    /// results carry the MID_SENTINEL word_id, while the seed entry is a
+    /// clone of the original delim and keeps its real word_id.
+    pub fn seed_index(&self) -> usize {
+        self.delims
+            .iter()
+            .position(|d| d.word_id != MID_SENTINEL)
+            .unwrap_or(0)
+    }
+
     /// Link target after sentinel adjustment (delim.vim:138-144).
     pub fn next_of(&self, i: usize) -> usize {
         self.next[i]

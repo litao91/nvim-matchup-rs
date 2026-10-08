@@ -267,6 +267,11 @@ impl Default for Perf {
 // ---------------------------------------------------------------------------
 
 pub struct State {
+    /// True while re-feeding keys for an operator-pending motion
+    /// (prevents recursion in the op() dance).
+    pub in_op: Cell<bool>,
+    /// Stashed v:operator during operator-pending motions.
+    pub op_operator: RefCell<String>,
     pub bufs: RefCell<HashMap<i32, BufCompiled>>,
     pub regex_cache: RefCell<HashMap<String, SharedRegex>>,
     /// Cache for expression-valued b:match_words (loader.vim:123).
@@ -287,6 +292,8 @@ pub struct MemoKey {
 impl State {
     pub fn new() -> State {
         State {
+            in_op: Cell::new(false),
+            op_operator: RefCell::new(String::new()),
             bufs: RefCell::new(HashMap::new()),
             regex_cache: RefCell::new(HashMap::new()),
             expr_cache: RefCell::new(HashMap::new()),

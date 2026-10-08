@@ -221,7 +221,7 @@ fn matchup_rs() -> Result<Dictionary> {
                 .collect();
             Object::from(Dictionary::from_iter([
                 ("delims", Object::from(arr)),
-                ("seed_index", Object::from(seed.match_index as i64)),
+                ("seed_index", Object::from(ml.seed_index() as i64)),
             ]))
         });
         r.unwrap_or_else(Object::nil)
@@ -355,6 +355,101 @@ fn matchup_rs() -> Result<Dictionary> {
 
 
 
+
+    // ---- motions & text objects (called from <cmd> keymap rhs) ----
+
+    /// Run a motion; if it made no progress while an operator is pending,
+    /// feed <esc> so vim does not hang waiting for a motion.
+    fn run_motion(state: &SharedState, name: &str, f: impl Fn(&Ctx) -> bool) {
+        guard(name, || {
+            with_ctx(state, |ctx| {
+                let moved = f(ctx);
+                if !moved {
+                    let m: String = api::eval("mode(1)").unwrap_or_default();
+                    if m.starts_with("no") {
+                        let k = nvim_oxi::String::from("\x1b");
+                        let md = nvim_oxi::String::from("n");
+                        api::feedkeys(&k, &md, false);
+                    }
+                }
+            });
+        });
+    }
+
+    let s = Rc::clone(&state);
+    let motion_matching: Function<(i64, i64), ()> =
+        Function::from_fn(move |(visual, down): (i64, i64)| -> nvim_oxi::Result<()> {
+            run_motion(&s, "motion_matching", |ctx| {
+                motion::find_matching_pair(ctx, visual != 0, down != 0)
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let motion_unmatched: Function<(i64, i64), ()> =
+        Function::from_fn(move |(visual, down): (i64, i64)| -> nvim_oxi::Result<()> {
+            run_motion(&s, "motion_unmatched", |ctx| {
+                motion::find_unmatched(ctx, visual != 0, down != 0, 750.0)
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let motion_jump_inside: Function<(i64,), ()> =
+        Function::from_fn(move |(visual,): (i64,)| -> nvim_oxi::Result<()> {
+            run_motion(&s, "motion_jump_inside", |ctx| {
+                motion::jump_inside(ctx, visual != 0)
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let motion_jump_inside_prev: Function<(i64,), ()> =
+        Function::from_fn(move |(visual,): (i64,)| -> nvim_oxi::Result<()> {
+            run_motion(&s, "motion_jump_inside_prev", |ctx| {
+                motion::jump_inside_prev(ctx, visual != 0)
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let motion_insert: Function<(), ()> =
+        Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+            guard("motion_insert", || {
+                with_ctx(&s, |ctx| motion::insert_mode(ctx));
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let op_motion: Function<(String,), ()> =
+        Function::from_fn(move |(plug,): (String,)| -> nvim_oxi::Result<()> {
+            guard("op_motion", || {
+                with_ctx(&s, |ctx| motion::op_motion(ctx, &plug));
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let textobj: Function<(i64, i64), ()> =
+        Function::from_fn(move |(inner, visual): (i64, i64)| -> nvim_oxi::Result<()> {
+            guard("textobj", || {
+                with_ctx(&s, |ctx| {
+                    textobj::delimited(ctx, inner != 0, visual != 0)
+                });
+            });
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let update_insert: Function<(), ()> =
+        Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+            guard("update_insert", || {
+                with_ctx(&s, |ctx| matchparen::highlight(ctx, true, true));
+            });
+            Ok(())
+        });
+
     Ok(Dictionary::from_iter([
         ("version", Object::from(env!("CARGO_PKG_VERSION"))),
         ("setup", Object::from(setup)),
@@ -369,5 +464,13 @@ fn matchup_rs() -> Result<Dictionary> {
         ("show_times", Object::from(show_times)),
         ("timer_callback", Object::from(timer_callback)),
         ("fade_timer_callback", Object::from(fade_timer_callback)),
+        ("update_insert", Object::from(update_insert)),
+        ("motion_matching", Object::from(motion_matching)),
+        ("motion_unmatched", Object::from(motion_unmatched)),
+        ("motion_jump_inside", Object::from(motion_jump_inside)),
+        ("motion_jump_inside_prev", Object::from(motion_jump_inside_prev)),
+        ("motion_insert", Object::from(motion_insert)),
+        ("op_motion", Object::from(op_motion)),
+        ("textobj", Object::from(textobj)),
     ]))
 }

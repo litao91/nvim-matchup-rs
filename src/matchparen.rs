@@ -6,12 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use nvim_oxi::api::{
-    self,
-    opts::CreateAutocmdOpts,
-    types::{AutocmdCallbackArgs, ExtmarkVirtTextPosition},
-};
-use nvim_oxi::{Array, Function, Object};
+use nvim_oxi::api::{self, opts::CreateAutocmdOpts, types::ExtmarkVirtTextPosition};
+use nvim_oxi::{Array, Object};
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts};
 use crate::state::{State, GOpts};
@@ -19,6 +15,34 @@ use crate::types::{Delim, MatchingList, Pos};
 use crate::words::{Side, SideQuery};
 
 type SharedState = Rc<State>;
+
+/// Temporary file-based tracing (err_writeln raises inside callbacks).
+pub fn trace(msg: &str) {
+    use std::io::Write;
+    if std::env::var("MRS_TRACE").is_ok() {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/mrs_trace.log")
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
+/// Namespace id, created lazily so highlighting works even if setup()
+/// has not run (create_namespace is idempotent by name).
+fn ns_id(state: &State) -> u32 {
+    {
+        let mp = state.matchparen.borrow();
+        if let Some(ns) = mp.ns {
+            return ns;
+        }
+    }
+    let ns = api::create_namespace("vim-matchup");
+    state.matchparen.borrow_mut().ns = Some(ns);
+    ns
+}
 
 // ---------------------------------------------------------------------------
 // Per-window matchparen state
@@ -53,11 +77,8 @@ pub struct MatchParenState {
 // ---------------------------------------------------------------------------
 
 pub fn setup(state: &SharedState) {
-    let ns = api::create_namespace("vim-matchup");
-    {
-        let mut mp = state.matchparen.borrow_mut();
-        mp.ns = Some(ns);
-    }
+    let ns = ns_id(state);
+    let _ = ns;
 
     let group = match api::create_augroup(
         "matchup_matchparen",
@@ -67,58 +88,46 @@ pub fn setup(state: &SharedState) {
         Err(_) => return,
     };
 
-    // CursorMoved,CursorMovedI,TextChanged,TextChangedI,TextChangedP
-    let s = Rc::clone(state);
-    let cb = Function::from_fn(move |_: AutocmdCallbackArgs| {
-        crate::with_ctx(&s, |ctx| highlight_deferred(ctx));
-        false
-    });
-    let _ = api::create_autocmd(
-        [
+    // NOTE: command-based autocmds; LuaRef callbacks register but never
+    // fire on nvim 0.13-dev (nvim-oxi 0.6 ABI mismatch).
+    let ac = |events: &[&str], command: &str, pattern: Option<&str>| {
+        let mut b = CreateAutocmdOpts::builder();
+        b.group(group).patterns([pattern.unwrap_or("*")]).command(command);
+        if let Err(e) = api::create_autocmd(events.iter().copied(), &b.build()) {
+            trace(&format!("autocmd {events:?} failed: {e:?}"));
+        }
+    };
+
+    ac(
+        &[
             "CursorMoved",
             "CursorMovedI",
             "TextChanged",
             "TextChangedI",
             "TextChangedP",
         ],
-        &CreateAutocmdOpts::builder().group(group).callback(cb).build(),
+        "lua require('matchup_rs').highlight_deferred()",
+        None,
     );
-
-    // WinEnter, InsertEnter, InsertChange, InsertLeave -> highlight(1)
-    let s = Rc::clone(state);
-    let cb = Function::from_fn(move |_: AutocmdCallbackArgs| {
-        crate::with_ctx(&s, |ctx| highlight(ctx, true, false));
-        false
-    });
-    let _ = api::create_autocmd(
-        ["WinEnter", "InsertEnter", "InsertChange", "InsertLeave"],
-        &CreateAutocmdOpts::builder().group(group).callback(cb).build(),
+    ac(
+        &["WinEnter", "InsertLeave"],
+        "lua require('matchup_rs').update()",
+        None,
     );
-
-    // OptionSet signcolumn -> highlight(1)
-    let s = Rc::clone(state);
-    let cb = Function::from_fn(move |_: AutocmdCallbackArgs| {
-        crate::with_ctx(&s, |ctx| highlight(ctx, true, false));
-        false
-    });
-    let _ = api::create_autocmd(
-        ["OptionSet"],
-        &CreateAutocmdOpts::builder()
-            .group(group)
-            .patterns(["signcolumn"])
-            .callback(cb)
-            .build(),
+    ac(
+        &["InsertEnter", "InsertChange"],
+        "lua require('matchup_rs').update_insert()",
+        None,
     );
-
-    // WinLeave,BufLeave -> clear
-    let s = Rc::clone(state);
-    let cb = Function::from_fn(move |_: AutocmdCallbackArgs| {
-        crate::with_ctx(&s, |ctx| clear(ctx));
-        false
-    });
-    let _ = api::create_autocmd(
-        ["WinLeave", "BufLeave"],
-        &CreateAutocmdOpts::builder().group(group).callback(cb).build(),
+    ac(
+        &["OptionSet"],
+        "lua require('matchup_rs').update()",
+        Some("signcolumn"),
+    );
+    ac(
+        &["WinLeave", "BufLeave"],
+        "lua require('matchup_rs').clear()",
+        None,
     );
 }
 
@@ -144,20 +153,21 @@ fn buf_or_gopt_bool(ctx: &Ctx, bname: &str, gval: bool) -> bool {
 /// Port of s:matchparen.highlight (matchparen.vim:332).
 pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     let g = ctx.gopts;
+    let tr = |why: &str| trace(&format!("HL early-out: {why}"));
     if !g.matchparen_enabled {
-        return;
+        tr("disabled"); return;
     }
-    if api::eval::<i64>("v:vim_starting").unwrap_or(0) != 0 {
-        return;
+    if api::eval::<i64>("has('vim_starting')").unwrap_or(0) != 0 {
+        tr("vim_starting"); return;
     }
     if g.matchparen_pumvisible == 0 && pumvisible() {
-        return;
+        tr("pumvisible"); return;
     }
     if api::eval::<String>("state('a')")
         .map(|s| !s.is_empty())
         .unwrap_or(false)
     {
-        return;
+        tr("state(a)"); return;
     }
     if ctx
         .buf
@@ -165,7 +175,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         .unwrap_or(1)
         == 0
     {
-        return;
+        tr("buf disabled"); return;
     }
 
     let real_mode: String = if changing_insert {
@@ -176,7 +186,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
 
     let cursor = match ctx.cursor() {
         Some(c) => c,
-        None => return,
+        None => { tr("no cursor"); return; }
     };
     let tick = ctx.buf.get_changedtick().unwrap_or(0);
     let win_h = ctx.win.handle();
@@ -185,7 +195,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         let mp = ctx.state.matchparen.borrow();
         if let Some(ws) = mp.wins.get(&win_h) {
             if ws.last_cursor == Some(cursor) && ws.last_tick == Some(tick) {
-                return;
+                tr("unchanged"); return;
             }
         }
     }
@@ -204,7 +214,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
 
     // mode blacklist
     if g.matchparen_nomode.contains(&real_mode) {
-        return;
+        tr("nomode"); return;
     }
 
     // visual-block EOL guard
@@ -214,13 +224,13 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     .unwrap_or(0)
         != 0
     {
-        return;
+        tr("visual-block-eol"); return;
     }
     if api::eval::<i64>("foldclosed(line('.'))").unwrap_or(-1) > -1 {
-        return;
+        tr("foldclosed"); return;
     }
     if ctx.synmaxcol != 0 && cursor.cnum as i64 > ctx.synmaxcol {
-        return;
+        tr("synmaxcol"); return;
     }
 
     let insertmode = real_mode == "i";
@@ -241,7 +251,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     o.highlighting = true;
     let current = match engine::get_delim(ctx, &o) {
         Some(d) => d,
-        None => return,
+        None => { tr("no current delim"); return; }
     };
     ctx.state.perf.toc("matchparen.highlight", "get_current");
 
@@ -255,19 +265,19 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     );
     ctx.state.perf.toc("matchparen.highlight", "get_matching");
     if ml.is_empty() {
-        return;
+        tr("empty matching list"); return;
     }
 
     // singleton check (matchparen.vim:456-462)
     let min_len = if current.side == Side::Mid { 3 } else { 2 };
     if ml.len() < min_len && !g.matchparen_singleton {
-        return;
+        tr("singleton"); return;
     }
 
     // prepare for (possibly) new highlights (fade level 1)
     let pos = Pos::new(current.lnum, current.cnum);
     if fade(ctx, 1, Some(pos), &mut token_save_pos) {
-        return;
+        tr("fade cancel"); return;
     }
 
     {
@@ -285,7 +295,11 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         }
     }
 
-    add_matches(ctx, &ml, Some(&current));
+    trace(&format!("HL rendering {} delims", ml.len()));
+    // pass the seed's list entry: its match_index is the list position,
+    // while `current` (from get_current) still has match_index 0
+    let seed_entry = ml.delims[ml.seed_index()].clone();
+    add_matches(ctx, &ml, Some(&seed_entry));
 
     if g.matchparen_hi_background {
         highlight_background(ctx, &ml);
@@ -534,7 +548,7 @@ pub fn fade_timer_callback(state: &SharedState, tid: i64) {
 /// Port of s:matchparen.clear (matchparen.vim:135).
 pub fn clear(ctx: &Ctx) {
     let win_h = ctx.win.handle();
-    let ns = ctx.state.matchparen.borrow().ns;
+    let ns = Some(ns_id(ctx.state));
     let match_ids: Vec<i64> = {
         let mut mp = ctx.state.matchparen.borrow_mut();
         let ws = mp.wins.entry(win_h).or_default();
@@ -581,10 +595,7 @@ fn wordish(d: &Delim) -> bool {
 
 /// Port of s:add_matches (matchparen.vim:1188), nvim >= 0.5 path.
 pub fn add_matches(ctx: &Ctx, ml: &MatchingList, current: Option<&Delim>) {
-    let ns = match ctx.state.matchparen.borrow().ns {
-        Some(ns) => ns,
-        None => return,
-    };
+    let ns = ns_id(ctx.state);
     let mwc: String = api::eval(
         "hlexists('MatchWordCur') ? 'MatchWordCur' : (synIDtrans(hlID('MatchWord')) == hlID('MatchParen') ? 'MatchParenCur' : 'MatchWord')",
     )
@@ -726,7 +737,15 @@ fn do_offscreen(ctx: &Ctx, ml: &MatchingList, current: &Delim, method: &str) {
 }
 
 fn do_offscreen_statusline(ctx: &Ctx, ml: &MatchingList, offscreen: &Delim, manual: bool) {
-    let (sl, _lnum) = status_str(ctx, ml, offscreen, manual);
+    let (mut sl, lnum) = status_str(ctx, ml, offscreen, manual);
+    // scroll refresh: re-highlight once the offscreen line scrolls into
+    // view (matchparen.vim:574-576)
+    if !manual {
+        let timer_ok: i64 = api::eval("matchup#rs#ensure_scroll_timer()").unwrap_or(0);
+        if timer_ok != 0 {
+            sl.push_str(&format!("%{{matchup#rs#scroll_update({lnum})}}"));
+        }
+    }
     {
         let mut win = ctx.win.clone();
         let _ = win.set_var("matchup_statusline", sl.clone());

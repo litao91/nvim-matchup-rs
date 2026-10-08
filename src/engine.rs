@@ -114,7 +114,8 @@ impl<'a> Ctx<'a> {
         win: NvimWindow,
         gopts: &'a GOpts,
     ) -> Ctx<'a> {
-        let cursor = win.get_cursor().map(|(r, _)| r + 1).unwrap_or(1);
+        // nvim_win_get_cursor: line is 1-based, col is 0-based
+        let cursor = win.get_cursor().map(|(r, _)| r).unwrap_or(1);
         let margin = gopts.delim_stopline.max(gopts.matchparen_stopline) + 100;
         let lines = Lines::fetch_for_cursor(&buf, cursor, margin);
         let mode: String = api::eval("mode(1)").unwrap_or_else(|_| "n".to_string());
@@ -132,8 +133,9 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn cursor(&self) -> Option<Pos> {
+        // nvim_win_get_cursor: line is 1-based, col is 0-based
         let (r, c) = self.win.get_cursor().ok()?;
-        Some(Pos::new(r + 1, c + 1))
+        Some(Pos::new(r, c + 1))
     }
 
     pub fn mode_char(&self) -> char {
@@ -310,11 +312,16 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
 
     ctx.state.perf.toc("s:get_delim", "setup");
 
-    // ---- first pass: locate the match ----
-    let hit = match opts.direction {
+    // ---- first pass: locate the match and classify it ----
+    // The union regex is obligation-free (deferred `\@N<=`/`\zs` prefixes),
+    // so a candidate hit that no word claims is a false positive which vim's
+    // engine would never have stopped at: keep scanning. A hit that some word
+    // claims but the parser rejects (syn requirement, \ze extent) mirrors
+    // vim's empty parser result: get_delim fails without retrying.
+    let found: Option<(Hit, Delim)> = match opts.direction {
         Direction::Current => {
             let line = ctx.lines.get1(cur.lnum)?;
-            let mut best: Option<Hit> = None;
+            let mut cont: Vec<Hit> = Vec::new();
             let mut pos = 0usize;
             loop {
                 let m = match ure.find_from_pos(line, pos) {
@@ -327,8 +334,8 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                 } else {
                     s <= raw0 && e > cur0
                 };
-                if contains && best.map_or(true, |b: Hit| s > b.start0) {
-                    best = Some(Hit {
+                if contains {
+                    cont.push(Hit {
                         lnum: cur.lnum,
                         start0: s,
                         end0: e,
@@ -339,11 +346,22 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                     None => break,
                 }
             }
-            best
+            let mut out = None;
+            for h in cont.iter().rev() {
+                match classify(ctx, line, *h, opts, cur0) {
+                    Classify::Claimed(d) => {
+                        out = Some((*h, d));
+                        break;
+                    }
+                    Classify::Rejected => return None,
+                    Classify::Unclaimed => continue,
+                }
+            }
+            out
         }
         Direction::Next => {
             let end_lnum = (cur.lnum + stopline).min(ctx.lines.max_lnum());
-            let mut found: Option<Hit> = None;
+            let mut out = None;
             'outer: for lnum in cur.lnum..=end_lnum {
                 let line = match ctx.lines.get1(lnum) {
                     Some(l) => l,
@@ -365,22 +383,27 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                         start0: s,
                         end0: e,
                     };
-                    if reject_by_skip(ctx, h, line, check_skip, true) {
-                        match next_pos(line, s) {
-                            Some(p) => pos = p,
-                            None => break,
+                    if !reject_by_skip(ctx, h, line, check_skip, true) {
+                        match classify(ctx, line, h, opts, cur0) {
+                            Classify::Claimed(d) => {
+                                out = Some((h, d));
+                                break 'outer;
+                            }
+                            Classify::Rejected => return None,
+                            Classify::Unclaimed => {}
                         }
-                        continue;
                     }
-                    found = Some(h);
-                    break 'outer;
+                    match next_pos(line, s) {
+                        Some(p) => pos = p,
+                        None => break,
+                    }
                 }
             }
-            found
+            out
         }
         Direction::Prev => {
             let start_lnum = cur.lnum.saturating_sub(stopline).max(1);
-            let mut found: Option<Hit> = None;
+            let mut out = None;
             'outer: for lnum in (start_lnum..=cur.lnum).rev() {
                 let line = match ctx.lines.get1(lnum) {
                     Some(l) => l,
@@ -410,17 +433,23 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
                     if reject_by_skip(ctx, *h, line, check_skip, false) {
                         continue;
                     }
-                    found = Some(*h);
-                    break 'outer;
+                    match classify(ctx, line, *h, opts, cur0) {
+                        Classify::Claimed(d) => {
+                            out = Some((*h, d));
+                            break 'outer;
+                        }
+                        Classify::Rejected => return None,
+                        Classify::Unclaimed => continue,
+                    }
                 }
             }
-            found
+            out
         }
     };
 
     ctx.state.perf.toc("s:get_delim", "first_pass");
 
-    let hit = hit?;
+    let (hit, delim) = found?;
     if ctx.state.perf.timeout_check() {
         return None;
     }
@@ -432,7 +461,6 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
         skip_state = skip_at(&ctx.bc.skip, line, hit.lnum, hit.cnum());
     }
 
-    let delim = classify(ctx, line, hit, opts, cur0)?;
     ctx.state.perf.toc("s:get_delim", "got_results");
     Some(Delim {
         skip: skip_state,
@@ -469,9 +497,24 @@ fn reject_by_skip(ctx: &Ctx, h: Hit, line: &str, check_skip: bool, forward: bool
 
 /// Port of s:parser_delim_new (delim.vim:527): identify which (set, side,
 /// word) matches at the hit and extract capture groups.
-fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -> Option<Delim> {
+/// Result of classifying a first-pass hit.
+enum Classify {
+    /// A word claimed the position and the delim was built.
+    Claimed(Delim),
+    /// A word's anchored pattern matched (obligations pass) but a
+    /// parser-level check failed (syn requirement, \ze extent): vim's
+    /// parser returns {} here, so get_delim fails without retrying.
+    Rejected,
+    /// No word claimed the position: a false positive of the
+    /// obligation-free union regex; vim's searchpos would have kept
+    /// scanning, so the caller continues.
+    Unclaimed,
+}
+
+fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -> Classify {
     let sides = opts.side.sides();
     let nsets = ctx.bc.sets.len();
+    let mut any_claimed = false;
     for si in 0..nsets {
         let cset = &ctx.bc.sets[si];
         let lset = &ctx.bc.lists.sets[si];
@@ -526,15 +569,18 @@ fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -
                 if m0.start() != hit.start0 {
                     continue;
                 }
+                if !checks_ok(checks, line, hit.start0) {
+                    continue;
+                }
+                // a word's anchored pattern matches here: this is a position
+                // vim's searchpos would have stopped at
+                any_claimed = true;
                 // for current, reject matches the cursor is outside of
                 // (matters for \ze; delim.vim:583-586)
                 if !use_hlend
                     && opts.direction == Direction::Current
                     && m0.end() <= cur0
                 {
-                    continue;
-                }
-                if !checks_ok(checks, line, hit.start0) {
                     continue;
                 }
                 // \g{syn;...} requirement (delim.vim:594-607)
@@ -585,7 +631,7 @@ fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -
                     }
                 }
 
-                return Some(Delim {
+                return Classify::Claimed(Delim {
                     lnum: hit.lnum,
                     cnum: hit.cnum(),
                     match_: match_text,
@@ -602,7 +648,11 @@ fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -
             }
         }
     }
-    None
+    if any_claimed {
+        Classify::Rejected
+    } else {
+        Classify::Unclaimed
+    }
 }
 
 // ---------------------------------------------------------------------------

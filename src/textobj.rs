@@ -28,7 +28,8 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
         }
         cnum = c0 + 1;
     }
-    let _ = win.set_cursor(p.lnum.saturating_sub(1), cnum.saturating_sub(1));
+    // nvim_win_set_cursor: line is 1-based, col is 0-based
+    let _ = win.set_cursor(p.lnum, cnum.saturating_sub(1));
 }
 
 fn motion_force() -> String {
@@ -139,6 +140,11 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     let visualmode = obj_str(vars.get(5));
     let sel_start = Pos::new(gi(6) as usize, gi(7) as usize);
     let sel_end = Pos::new(gi(8) as usize, gi(9) as usize);
+    crate::matchparen::trace(&format!(
+        "TOBJ visual={} inner={} sel=({:?},{:?}) count={} count1={} op=[{}] vmode=[{}] mode=[{:?}] cursor={:?}",
+        visual, is_inner, sel_start, sel_end, count, count1, operator, visualmode,
+        ctx.mode, ctx.cursor()
+    ));
 
     let mut win = ctx.win.clone();
 
@@ -219,6 +225,10 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
         let (_open, close_, ml) = match engine::get_surrounding(ctx, cnt, &opts) {
             Some(r) => r,
             None => {
+                crate::matchparen::trace(&format!(
+                    "TOBJ surround FAIL local={} try_again={} cnt={}",
+                    local, try_again, cnt
+                ));
                 if visual {
                     normal("gv");
                 } else {
@@ -482,6 +492,10 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     }
 
     // apply selection
+    crate::matchparen::trace(&format!(
+        "TOBJ apply ({},{})-({},{}) select_mode=[{}]",
+        l1, c1, l2, c2, select_mode
+    ));
     normal(&select_mode);
     normal("o");
     set_cursor(&mut win, ctx, Pos::new(l1, c1));
@@ -514,32 +528,34 @@ fn html_close_like(m: &str) -> bool {
 // keymaps
 // ---------------------------------------------------------------------------
 
-pub fn setup(state: &SharedState) {
+pub fn setup(_state: &SharedState) {
     let enabled: i64 = api::get_var("matchup_text_obj_enabled").unwrap_or(1);
     let mappings_enabled: i64 = api::get_var("matchup_mappings_enabled").unwrap_or(1);
     if enabled == 0 || mappings_enabled == 0 {
         return;
     }
 
-    for (lhs, inner) in [("i%", true), ("a%", false)] {
+    let opts = SetKeymapOpts::builder()
+        .noremap(true)
+        .silent(true)
+        .build();
+
+    for (lhs, inner) in [("i%", 1), ("a%", 0)] {
+        let plug = format!("<Plug>(matchup-{lhs})");
         for (mode, mode_s, visual) in [
-            (Mode::Visual, "x", true),
-            (Mode::OperatorPending, "o", false),
+            (Mode::Visual, "x", 1),
+            (Mode::OperatorPending, "o", 0),
         ] {
-            let s = Rc::clone(state);
-            let i = inner;
-            let v = visual;
-            let cb = Function::from_fn(move |()| {
-                crate::with_ctx(&s, |ctx| delimited(ctx, i, v));
-            });
-            let opts = SetKeymapOpts::builder()
-                .noremap(true)
-                .silent(true)
-                .callback(cb)
-                .build();
-            let plug = format!("<Plug>(matchup-{lhs})");
-            let _ = api::set_keymap(mode, &plug, "", &opts);
-            // guarded default mapping
+            // visual mode must drop out of visual before the callback (as the
+            // original's `:<c-u>` plug does) so that `normal! v` inside
+            // re-enters visual mode to apply the new selection; <cmd> would
+            // keep visual active and toggle it off instead
+            let rhs = if visual == 1 {
+                format!(":<c-u>lua require('matchup_rs').textobj({inner},1)<cr>")
+            } else {
+                format!("<cmd>lua require('matchup_rs').textobj({inner},{visual})<cr>")
+            };
+            let _ = api::set_keymap(mode, &plug, &rhs, &opts);
             let unmapped: String = api::eval(&format!(
                 "maparg({}, {})",
                 crate::motion::vim_quote(lhs),
@@ -553,7 +569,7 @@ pub fn setup(state: &SharedState) {
             ))
             .unwrap_or(0);
             if unmapped.is_empty() && has == 0 {
-                let _ = api::set_keymap(mode, lhs, "", &opts);
+                let _ = api::set_keymap(mode, lhs, &rhs, &opts);
             }
         }
     }

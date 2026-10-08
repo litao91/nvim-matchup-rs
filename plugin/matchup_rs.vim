@@ -20,13 +20,33 @@ endif
 if exists('g:loaded_matchup_rs')
   finish
 endif
+" if the original vim-matchup already loaded, stay out of its way
+if exists('*matchup#init')
+  finish
+endif
 let g:loaded_matchup_rs = 1
+" claim vim-matchup's global: the copied after/ftplugin files guard on it,
+" and the original plugin skips loading when it is already set
+let g:loaded_matchup = 1
 
 let s:save_cpo = &cpo
 set cpo&vim
 
 " disable matchit
 let g:loaded_matchit = 1
+
+" neuter the bundled matchit plugin (nvim ships it as a default plugin);
+" port of vim-matchup's unmatchit.vim
+if exists(':MatchDebug')
+  delcommand MatchDebug
+endif
+unlet! g:loaded_matchit
+let g:loaded_matchit = 1
+silent! unmap %
+silent! unmap [%
+silent! unmap ]%
+silent! unmap a%
+silent! unmap g%
 
 " ensure pi_paren is loaded but deactivated (as in vim-matchup)
 try
