@@ -1029,6 +1029,24 @@ fn contains_capture(n: &Node) -> bool {
     }
 }
 
+/// Emit a `\%[...]` branch as progressively-optional atoms:
+/// `[a, b, c]` becomes `(?:a(?:b(?:c)?)?)?`.
+fn emit_seq_opt(a: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
+    let atoms: Vec<&Node> = match a {
+        Node::Concat(v) => v.iter().collect(),
+        Node::Empty => return Ok(()),
+        other => vec![other],
+    };
+    for atom in &atoms {
+        out.push_str("(?:");
+        emit(atom, out, ec)?;
+    }
+    for _ in &atoms {
+        out.push_str(")?");
+    }
+    Ok(())
+}
+
 fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
     match n {
         Node::Empty => {}
@@ -1061,13 +1079,24 @@ fn emit(n: &Node, out: &mut String, ec: &mut EmitCtx) -> Result<()> {
             out.push(')');
         }
         Node::Optional { alt } => {
-            out.push_str("(?:");
+            // vim `\%[abc]` matches '', 'a', 'ab' or 'abc': each atom is
+            // progressively optional, so emit nested optionals rather than
+            // one all-or-nothing group
             let was_top = std::mem::replace(&mut ec.top, false);
-            for a in alt {
-                emit(a, out, ec)?;
+            let multi = alt.len() != 1;
+            if multi {
+                out.push_str("(?:");
+            }
+            for (bi, a) in alt.iter().enumerate() {
+                if bi > 0 {
+                    out.push('|');
+                }
+                emit_seq_opt(a, out, ec)?;
+            }
+            if multi {
+                out.push(')');
             }
             ec.top = was_top;
-            out.push_str(")?");
         }
         Node::Quantified { atom, q, greedy } => {
             let needs_group = !matches!(
@@ -1472,14 +1501,20 @@ mod tests {
     #[test]
     fn basic_keywords() {
         assert_eq!(t(r"\<if\>"), r"(?<!\w)(?=\w)if(?<=\w)(?!\w)");
-        assert_eq!(t(r"\<el\%[seif]\>"), r"(?<!\w)(?=\w)el(?:seif)?(?<=\w)(?!\w)");
+        assert_eq!(
+            t(r"\<el\%[seif]\>"),
+            r"(?<!\w)(?=\w)el(?:s(?:e(?:i(?:f)?)?)?)?(?<=\w)(?!\w)"
+        );
     }
 
     #[test]
     fn groups_and_alts() {
         assert_eq!(t(r"\%(foo\|bar\)"), "(?:foo|bar)");
         assert_eq!(t(r"\(foo\)"), "(foo)");
-        assert_eq!(t(r"\%(wh\%[ile]\|for\)"), "(?:wh(?:ile)?|for)");
+        assert_eq!(
+            t(r"\%(wh\%[ile]\|for\)"),
+            "(?:wh(?:i(?:l(?:e)?)?)?|for)"
+        );
     }
 
     #[test]
@@ -1505,7 +1540,10 @@ mod tests {
     fn lookarounds() {
         // Variable-width lookbehind becomes a prefix-check obligation.
         let tr = tt(r"\%(\%(^\||\)\s*\)\@<=\<retu\%[rn]\>");
-        assert_eq!(tr.pattern, r"(?<!\w)(?=\w)retu(?:rn)?(?<=\w)(?!\w)");
+        assert_eq!(
+            tr.pattern,
+            r"(?<!\w)(?=\w)retu(?:r(?:n)?)?(?<=\w)(?!\w)"
+        );
         assert_eq!(
             tr.prefix_checks,
             vec![PrefixCheck {
@@ -1613,6 +1651,24 @@ mod tests {
             vec!["a", r"b\:c", "d"]
         );
         assert_eq!(split_not_bslash(r"a\\:b", ':'), vec![r"a\\", "b"]);
+    }
+
+    #[test]
+    fn optional_group_sequence_behavior() {
+        // vim's \%[seif] matches any prefix of the atom sequence:
+        // '', 's', 'se', 'sei', 'seif' - so both "else" and "elseif"
+        // match \<el\%[seif]\>, while "elif" does not
+        let re = fancy_regex::Regex::new(&t(r"\<el\%[seif]\>")).unwrap();
+        let m = |s: &str| {
+            re.find(s)
+                .unwrap()
+                .map(|m| (m.start(), m.as_str().to_string()))
+        };
+        assert_eq!(m("else"), Some((0, "else".to_string())));
+        assert_eq!(m("elseif 2"), Some((0, "elseif".to_string())));
+        assert_eq!(m("x = els"), Some((4, "els".to_string())));
+        assert_eq!(m("elif"), None);
+        assert_eq!(m("element"), None); // \> blocks the partial match
     }
 
     #[test]
