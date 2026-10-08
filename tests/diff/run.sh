@@ -5,17 +5,25 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 REPO=$(pwd)
 ORIG=${ORIG:-/mnt/data/repos/vim-matchup}
-OUT_RS=${OUT_RS:-/tmp/diff_rs.jsonl}
-OUT_ORIG=${OUT_ORIG:-/tmp/diff_orig.jsonl}
+SITE=${SITE:-/mnt/data/local/share/nvim/site}
+TS=${TS:-0}
+SUFFIX=""
+TS_CMD="let g:matchup_treesitter_enabled = v:false"
+if [ "$TS" = "1" ]; then
+  SUFFIX="_ts"
+  TS_CMD="let g:matchup_treesitter_enabled = 1"
+fi
+OUT_RS=${OUT_RS:-/tmp/diff_rs$SUFFIX.jsonl}
+OUT_ORIG=${OUT_ORIG:-/tmp/diff_orig$SUFFIX.jsonl}
 
 NVIM_FLAGS=(--headless --clean -u NONE
   --cmd "set noswapfile"
-  --cmd "let g:matchup_treesitter_enabled = 0"
+  --cmd "$TS_CMD"
   --cmd "filetype plugin on")
 
 echo "== rust engine =="
 timeout 900 nvim "${NVIM_FLAGS[@]}" \
-  --cmd "set rtp+=$REPO" \
+  --cmd "set rtp+=$REPO,$REPO/after,$SITE" \
   --cmd "let g:engine = 'rs'" \
   --cmd "let g:repo = '$REPO'" \
   --cmd "let g:diff_out = '$OUT_RS'" \
@@ -23,7 +31,7 @@ timeout 900 nvim "${NVIM_FLAGS[@]}" \
 
 echo "== original engine =="
 timeout 900 nvim "${NVIM_FLAGS[@]}" \
-  --cmd "set rtp+=$ORIG" \
+  --cmd "set rtp+=$ORIG,$ORIG/after,$SITE" \
   --cmd "let g:engine = 'orig'" \
   --cmd "let g:repo = '$REPO'" \
   --cmd "let g:diff_out = '$OUT_ORIG'" \

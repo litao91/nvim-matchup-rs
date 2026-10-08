@@ -143,10 +143,22 @@ pub struct GOpts {
     pub motion_override_npercent: i64,
     pub motion_keepjumps: bool,
     pub text_obj_linewise_operators: Vec<String>,
+    pub ts_enabled: bool,
+    pub ts_disabled: Vec<String>,
+    pub ts_stopline: usize,
+    pub ts_enable_quotes: bool,
+    pub ts_include_match_words: bool,
 }
 
 fn gvar_i64(name: &str, default: i64) -> i64 {
     api::get_var::<i64>(name).unwrap_or(default)
+}
+
+/// Read an option that may be a vimscript Boolean (v:true/v:false) or a
+/// Number; `+` coerces both, and an unset variable falls back to default.
+fn gvar_bool(name: &str, default: i64) -> i64 {
+    api::eval::<i64>(&format!("+get(g:, {q}, {d})", q = crate::motion::vim_quote(name), d = default))
+        .unwrap_or(default)
 }
 
 fn gvar_f64(name: &str, default: f64) -> f64 {
@@ -200,6 +212,12 @@ impl GOpts {
             motion_override_npercent: gvar_i64("matchup_motion_override_Npercent", 6),
             motion_keepjumps: gvar_i64("matchup_motion_keepjumps", 0) != 0,
             text_obj_linewise_operators: linewise,
+            ts_enabled: gvar_bool("matchup_treesitter_enabled", 0) != 0,
+            ts_disabled: api::get_var::<Vec<String>>("matchup_treesitter_disabled")
+                .unwrap_or_default(),
+            ts_stopline: gvar_i64("matchup_treesitter_stopline", 400).max(0) as usize,
+            ts_enable_quotes: gvar_bool("matchup_treesitter_enable_quotes", 1) != 0,
+            ts_include_match_words: gvar_bool("matchup_treesitter_include_match_words", 0) != 0,
         }
     }
 }
@@ -320,6 +338,7 @@ pub struct State {
     pub surround_memo: RefCell<HashMap<i32, (u32, HashMap<MemoKey, Option<Delim>>)>>,
     pub matchparen: RefCell<crate::matchparen::MatchParenState>,
     pub perf: Perf,
+    pub ts: RefCell<crate::treesitter::TsState>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -351,6 +370,7 @@ impl State {
             surround_memo: RefCell::new(HashMap::new()),
             matchparen: RefCell::new(Default::default()),
             perf: Perf::new(),
+            ts: RefCell::new(Default::default()),
         }
     }
 
@@ -358,6 +378,7 @@ impl State {
         self.bufs.borrow_mut().clear();
         self.expr_cache.borrow_mut().clear();
         self.surround_memo.borrow_mut().clear();
+        crate::treesitter::invalidate(self, None);
     }
 
     /// Translate + compile with the shared cache.
@@ -645,11 +666,21 @@ fn hash_inputs(parts: &[&str]) -> u64 {
 
 /// Ensure the buffer's compiled state is current; returns the buffer
 /// handle. Port of matchup#loader#init_buffer/refresh_match_words.
-pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
+/// How the treesitter engine modifies the classic match_words load
+/// (loader.vim:24-33): None = TS inactive, NoWords = drop match_words,
+/// Filter = keep only punctuation-only sets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TsWords {
+    None,
+    NoWords,
+    Filter,
+}
+
+pub fn ensure_buf(state: &State, buf: &Buffer, ts_words: TsWords) -> i32 {
     let h = buf.handle();
 
     let match_words_raw = buf_var_string(buf, "match_words");
-    let match_words = if !match_words_raw.is_empty() && !match_words_raw.contains(':') {
+    let mut match_words = if !match_words_raw.is_empty() && !match_words_raw.contains(':') {
         // expression-valued: evaluate and use the global cache.
         // SECURITY NOTE: this mirrors vim-matchup's own behavior
         // (`execute 'let l:match_words =' b:match_words`, loader.vim:97).
@@ -668,6 +699,21 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
     } else {
         match_words_raw
     };
+    match ts_words {
+        TsWords::NoWords => match_words = String::new(),
+        TsWords::Filter => {
+            let sets = crate::vimregex::split_not_bslash(&match_words, ',');
+            let kept: Vec<String> = sets
+                .into_iter()
+                .filter(|s| {
+                    (3..=18).contains(&s.chars().count())
+                        && s.bytes().all(|c| !c.is_ascii_alphabetic())
+                })
+                .collect();
+            match_words = kept.join(",");
+        }
+        TsWords::None => {}
+    }
 
     let matchpairs = buf_option(buf, "matchpairs");
     let iskeyword = buf_option(buf, "iskeyword");
@@ -688,6 +734,11 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
                 .join("\u{2}")
         })
         .unwrap_or_default();
+    let ts_mode = match ts_words {
+        TsWords::None => "0",
+        TsWords::NoWords => "1",
+        TsWords::Filter => "2",
+    };
     let hash = hash_inputs(&[
         &match_words,
         &matchpairs,
@@ -696,6 +747,7 @@ pub fn ensure_buf(state: &State, buf: &Buffer) -> i32 {
         &midmap_key,
         if nomps { "1" } else { "0" },
         if ignorecase { "1" } else { "0" },
+        ts_mode,
     ]);
 
     {

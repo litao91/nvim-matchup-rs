@@ -211,12 +211,12 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
     }
 
     let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
-    let mut delim = match engine::get_delim(ctx, &o) {
+    let mut delim = match engine::get_delim_multi(ctx, &o) {
         Some(d) => d,
         None => {
             trace("FMP current empty, trying next");
             o = GetDelimOpts::new(Direction::Next, SideQuery::BothAll);
-            match engine::get_delim(ctx, &o) {
+            match engine::get_delim_multi(ctx, &o) {
                 Some(d) => d,
                 None => { trace("FMP no delim at all"); return false; }
             }
@@ -507,14 +507,14 @@ pub fn jump_inside(ctx: &Ctx, visual: bool) -> bool {
     for counter in 0..vars.count1 {
         let delim = if counter > 0 {
             let o = GetDelimOpts::new(Direction::Next, SideQuery::Open);
-            engine::get_delim(ctx, &o)
+            engine::get_delim_multi(ctx, &o)
         } else {
             let o = GetDelimOpts::new(Direction::Current, SideQuery::Open);
-            match engine::get_delim(ctx, &o) {
+            match engine::get_delim_multi(ctx, &o) {
                 Some(d) => Some(d),
                 None => {
                     let o = GetDelimOpts::new(Direction::Next, SideQuery::Open);
-                    engine::get_delim(ctx, &o)
+                    engine::get_delim_multi(ctx, &o)
                 }
             }
         };
@@ -595,7 +595,7 @@ pub fn jump_inside_prev(ctx: &Ctx, visual: bool) -> bool {
     let mut new_pos: Option<Pos> = None;
     'outer: for _ in 0..vars.count1 {
         let o = GetDelimOpts::new(Direction::Current, SideQuery::Open);
-        if let Some(d) = engine::get_delim(ctx, &o) {
+        if let Some(d) = engine::get_delim_multi(ctx, &o) {
             let mut win = ctx.win.clone();
             let pl = ctx.lines.get1(d.lnum).unwrap_or("");
             let ppl = ctx.lines.get1(d.lnum.saturating_sub(1)).unwrap_or("");
@@ -605,7 +605,7 @@ pub fn jump_inside_prev(ctx: &Ctx, visual: bool) -> bool {
 
         for _tries in 0..2 {
             let o = GetDelimOpts::new(Direction::Prev, SideQuery::Open);
-            let delim = match engine::get_delim(ctx, &o) {
+            let delim = match engine::get_delim_multi(ctx, &o) {
                 Some(d) => d,
                 None => {
                     let mut win = ctx.win.clone();
@@ -663,7 +663,7 @@ pub fn insert_mode(ctx: &Ctx) {
     ctx.state.perf.timeout_start(0.0);
     let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
     o.insertmode = true;
-    let delim = match engine::get_delim(ctx, &o) {
+    let delim = match engine::get_delim_multi(ctx, &o) {
         Some(d) => d,
         None => return,
     };

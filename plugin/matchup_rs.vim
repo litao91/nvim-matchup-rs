@@ -123,7 +123,7 @@ call s:init_option('matchup_text_obj_linewise_operators', ['d', 'y'])
 call s:init_option('matchup_matchpref', {})
 
 " treesitter engine options (the Rust treesitter engine reads these)
-call s:init_option('matchup_treesitter_enabled', v:false)
+call s:init_option('matchup_treesitter_enabled', has('nvim-0.11.2') ? v:true : v:false)
 call s:init_option('matchup_treesitter_disabled', [])
 call s:init_option('matchup_treesitter_enable_quotes', v:true)
 call s:init_option('matchup_treesitter_disable_virtual_text', v:false)

@@ -107,6 +107,8 @@ pub struct Ctx<'a> {
     /// Whether vim syntax highlighting is loaded (`g:syntax_on`); when
     /// false every synID() is 0 and syntax-based skips are constant.
     pub syntax_on: bool,
+    /// Treesitter language for this buffer when the TS engine is active.
+    pub ts_lang: Option<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -124,6 +126,11 @@ impl<'a> Ctx<'a> {
         let mode: String = api::eval("mode(1)").unwrap_or_else(|_| "n".to_string());
         let synmaxcol: i64 = api::eval("&synmaxcol").unwrap_or(0);
         let syntax_on: i64 = api::eval("exists('g:syntax_on')").unwrap_or(0);
+        let ts_lang = if gopts.ts_enabled {
+            crate::treesitter::active_lang(state, gopts, buf.handle())
+        } else {
+            None
+        };
         Ctx {
             state,
             bc,
@@ -134,6 +141,7 @@ impl<'a> Ctx<'a> {
             mode,
             synmaxcol,
             syntax_on: syntax_on != 0,
+            ts_lang,
         }
     }
 
@@ -500,6 +508,42 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     })
 }
 
+/// Port of s:get_delim_multi (delim.vim:43): merge the treesitter and
+/// classic engine results. Current: treesitter wins when non-empty (the
+/// original returns the first non-empty engine result, treesitter first);
+/// next/prev: the position closest to the cursor in the scan direction.
+pub fn get_delim_multi(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
+    let ts = ctx.ts_lang.as_ref().and_then(|lang| {
+        crate::treesitter::get_delim(
+            ctx.state,
+            ctx.gopts,
+            &ctx.buf,
+            ctx.buf.handle(),
+            lang,
+            opts,
+        )
+    });
+    match opts.direction {
+        Direction::Current => ts.or_else(|| get_delim(ctx, opts)),
+        direction => {
+            let classic = get_delim(ctx, opts);
+            match (ts, classic) {
+                (Some(t), Some(c)) => {
+                    let tv = Pos::new(t.lnum, t.cnum).val();
+                    let cv = Pos::new(c.lnum, c.cnum).val();
+                    let take_ts = if direction == Direction::Next {
+                        tv <= cv
+                    } else {
+                        tv >= cv
+                    };
+                    Some(if take_ts { t } else { c })
+                }
+                (t, c) => t.or(c),
+            }
+        }
+    }
+}
+
 /// Skip-based rejection during next/prev scans (delim.vim:443-457).
 fn reject_by_skip(ctx: &Ctx, h: Hit, line: &str, check_skip: bool, forward: bool) -> bool {
     let noskips = ctx.gopts.delim_noskips;
@@ -706,6 +750,7 @@ fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -
             augment_unresolved,
             highlighting: opts.highlighting,
             match_index: 0,
+            ts_id: 0,
         });
     }
     if any_claimed {
@@ -1393,7 +1438,22 @@ pub fn get_matching(ctx: &Ctx, seed: &Delim, opts: &MatchOpts) -> MatchingList {
         if !matches.is_empty() {
             matches.push(None);
         }
-        let res = get_matching_raw(ctx, &mut work, down, stopline);
+        let res = if seed.ts_id != 0 {
+            match &ctx.ts_lang {
+                Some(lang) => crate::treesitter::get_matching(
+                    ctx.state,
+                    ctx.gopts,
+                    &ctx.buf,
+                    ctx.buf.handle(),
+                    lang,
+                    seed.ts_id,
+                    down,
+                ),
+                None => Vec::new(),
+            }
+        } else {
+            get_matching_raw(ctx, &mut work, down, stopline)
+        };
         if res.is_empty() {
             continue;
         }
@@ -1542,13 +1602,21 @@ pub fn get_surrounding(
             cnum: walk.cnum,
             mode,
         };
-        let cached = ctx
-            .state
-            .surround_memo
-            .borrow()
-            .get(&bufh)
-            .and_then(|(_, m)| m.get(&key))
-            .cloned();
+        // the treesitter engine's delim-info cache is a small LRU keyed by
+        // uuid; a memoized TS delim can outlive its cache entry, so the
+        // memo is only used for classic-engine walks (the original's memo
+        // keys include curswant and rarely hit across calls)
+        let use_memo = ctx.ts_lang.is_none();
+        let cached = if use_memo {
+            ctx.state
+                .surround_memo
+                .borrow()
+                .get(&bufh)
+                .and_then(|(_, m)| m.get(&key))
+                .cloned()
+        } else {
+            None
+        };
         let open_opt = match cached {
             Some(v) => v,
             None => {
@@ -1563,14 +1631,16 @@ pub fn get_surrounding(
                 o.check_skip = check_skip;
                 o.stopline = stopline;
                 o.at = Some(walk);
-                let d = get_delim(ctx, &o);
-                ctx.state
-                    .surround_memo
-                    .borrow_mut()
-                    .entry(bufh)
-                    .or_insert_with(|| (tick, HashMap::new()))
-                    .1
-                    .insert(key, d.clone());
+                let d = get_delim_multi(ctx, &o);
+                if use_memo {
+                    ctx.state
+                        .surround_memo
+                        .borrow_mut()
+                        .entry(bufh)
+                        .or_insert_with(|| (tick, HashMap::new()))
+                        .1
+                        .insert(key, d.clone());
+                }
                 d
             }
         };
@@ -1689,7 +1759,7 @@ pub fn jump_target(ctx: &Ctx, delim: &Delim) -> usize {
     for _ in 0..delim.match_.len() - 1 {
         let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
         o.at = Some(Pos::new(delim.lnum, column.max(1) as usize));
-        match get_delim(ctx, &o) {
+        match get_delim_multi(ctx, &o) {
             None => break,
             Some(t) if t.set == delim.set => break,
             Some(_) => column -= 1,

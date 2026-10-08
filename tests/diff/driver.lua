@@ -11,6 +11,15 @@ local repo = vim.g.repo
 local out_path = vim.g.diff_out
 
 local sample_names = { 'sample.vim', 'sample.lua', 'sample.c', 'sample.html' }
+if vim.g.diff_filter and vim.g.diff_filter ~= '' then
+  local keep = {}
+  for part in string.gmatch(vim.g.diff_filter, '[^,]+') do keep[part] = true end
+  local filtered = {}
+  for _, n in ipairs(sample_names) do
+    if keep[n] then filtered[#filtered + 1] = n end
+  end
+  sample_names = filtered
+end
 
 if engine == 'orig' then
   -- normalize in vimscript: delim dicts contain Funcrefs which do not
@@ -30,6 +39,9 @@ if engine == 'orig' then
       return DiffNorm(matchup#delim#get_prev('all', 'both_all', {}))
     endfunction
     function! DiffMat() abort
+      " the treesitter get_matching bails when the perf budget is 0; the
+      " rust raw handlers run with the budget disabled, so use a huge one
+      call matchup#perf#timeout_start(100000000)
       let l:d = matchup#delim#get_current('all', 'both_all', {})
       if empty(l:d) | return v:null | endif
       let l:ms = matchup#delim#get_matching(l:d, {})
@@ -41,6 +53,7 @@ if engine == 'orig' then
       return l:out
     endfunction
     function! DiffSur() abort
+      call matchup#perf#timeout_start(100000000)
       let l:s = matchup#delim#get_surrounding('all', 1, {'local': 0})
       if empty(l:s[0]) | return v:null | endif
       return [DiffNorm(l:s[0]), DiffNorm(l:s[1])]

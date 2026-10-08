@@ -95,6 +95,8 @@ pub struct Delim {
     pub augment_unresolved: BTreeMap<Grp, Grp>,
     pub highlighting: bool,
     pub match_index: usize,
+    /// Treesitter engine cache id (0 = classic engine delim).
+    pub ts_id: u64,
 }
 
 impl Delim {
@@ -207,6 +209,7 @@ mod tests {
             augment_unresolved: BTreeMap::new(),
             highlighting: false,
             match_index: 0,
+            ts_id: 0,
         };
         assert_eq!(d.end_offset(), 2);
         assert_eq!(d.end_pos(), Pos::new(1, 3));

@@ -19,7 +19,8 @@ pub mod motion;
 pub mod skip;
 pub mod state;
 pub mod textobj;
-pub mod types;
+pub mod treesitter;
+mod types;
 pub mod vimregex;
 pub mod words;
 
@@ -129,7 +130,17 @@ pub(crate) fn with_ctx_for<R>(
     win: &Window,
     f: impl FnOnce(&Ctx) -> R,
 ) -> Option<R> {
-    ensure_buf(state, buf);
+    let gopts0 = state::GOpts::read();
+    let ts_words = if gopts0.ts_enabled {
+        match crate::treesitter::active_lang(state, &gopts0, buf.handle()) {
+            Some(_) if gopts0.ts_include_match_words => state::TsWords::Filter,
+            Some(_) => state::TsWords::NoWords,
+            None => state::TsWords::None,
+        }
+    } else {
+        state::TsWords::None
+    };
+    ensure_buf(state, buf, ts_words);
     let h = buf.handle();
     let gopts = GOpts::read();
     let bufs = state.bufs.borrow();
@@ -178,7 +189,7 @@ fn matchup_rs() -> Result<Dictionary> {
         }
         let r = with_ctx(&s, |ctx| {
             s.perf.timeout_start(0.0); // no budget for raw calls
-            engine::get_delim(ctx, &o).map(|d| Object::from(delim_to_dict(&d)))
+            engine::get_delim_multi(ctx, &o).map(|d| Object::from(delim_to_dict(&d)))
         });
         r.flatten().unwrap_or_else(Object::nil)
         }))
@@ -194,7 +205,7 @@ fn matchup_rs() -> Result<Dictionary> {
             let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
             o.at = Some(types::Pos::new(lnum.max(1) as usize, cnum.max(1) as usize));
             o.highlighting = highlighting.unwrap_or(false);
-            let seed = match engine::get_delim(ctx, &o) {
+            let seed = match engine::get_delim_multi(ctx, &o) {
                 Some(d) => d,
                 None => return Object::nil(),
             };

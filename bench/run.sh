@@ -10,7 +10,7 @@ OUT_ORIG=${OUT_ORIG:-/tmp/bench_orig.json}
 
 NVIM_FLAGS=(--headless --clean -u NONE
   --cmd "set noswapfile"
-  --cmd "let g:matchup_treesitter_enabled = 0"
+  --cmd "let g:matchup_treesitter_enabled = v:false"
   --cmd "filetype plugin on")
 
 echo "== rust engine =="

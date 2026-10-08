@@ -249,7 +249,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     o.insertmode = insertmode;
     o.stopline = g.matchparen_stopline;
     o.highlighting = true;
-    let current = match engine::get_delim(ctx, &o) {
+    let current = match engine::get_delim_multi(ctx, &o) {
         Some(d) => d,
         None => { tr("no current delim"); return; }
     };
