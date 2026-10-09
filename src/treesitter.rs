@@ -280,7 +280,7 @@ pub fn query(state: &State, lang: &str) -> Option<Rc<Query>> {
             Some(q)
         }
         Err(e) => {
-            crate::matchparen::trace(&format!("TS query compile failed for {lang}: {e}"));
+            crate::matchparen::trace_with(|| format!("TS query compile failed for {lang}: {e}"));
             state.ts.borrow_mut().query_failed.insert(lang.to_string());
             None
         }

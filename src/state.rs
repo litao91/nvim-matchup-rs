@@ -544,8 +544,9 @@ pub struct State {
     pub matchparen: RefCell<crate::matchparen::MatchParenState>,
     pub perf: Perf,
     pub ts: RefCell<crate::treesitter::TsState>,
-    /// Configuration supplied via `require('matchup_rs').setup{...}`.
-    pub gopts: RefCell<GOpts>,
+    /// Configuration supplied via `require('matchup_rs').setup{...}`. Shared via
+    /// `Rc` so `gopts()` is a refcount bump, not a deep clone, on every op.
+    pub gopts: RefCell<Rc<GOpts>>,
     /// Per-buffer filetype config derived by the native ftplugin (replaces
     /// the `b:match_*` / `b:matchup_*` buffer variables).
     pub ft_config: RefCell<HashMap<i32, FtConfig>>,
@@ -592,7 +593,7 @@ impl State {
             matchparen: RefCell::new(Default::default()),
             perf: Perf::new(),
             ts: RefCell::new(Default::default()),
-            gopts: RefCell::new(GOpts::default()),
+            gopts: RefCell::new(Rc::new(GOpts::default())),
             ft_config: RefCell::new(HashMap::new()),
             activated: Cell::new(false),
             eff_curpos: Cell::new((1, 1)),
@@ -626,18 +627,21 @@ impl State {
         crate::treesitter::invalidate(self, Some(bufnr));
     }
 
-    /// Snapshot of the setup(opts) configuration.
-    pub fn gopts(&self) -> GOpts {
-        self.gopts.borrow().clone()
+    /// Shared handle to the setup(opts) configuration - a cheap `Rc` clone.
+    /// GOpts is treated as immutable; the rare toggles below copy-on-write.
+    pub fn gopts(&self) -> Rc<GOpts> {
+        Rc::clone(&self.gopts.borrow())
     }
 
     pub fn set_gopts(&self, g: GOpts) {
-        *self.gopts.borrow_mut() = g;
+        *self.gopts.borrow_mut() = Rc::new(g);
     }
 
-    /// `:NoMatchParen` / `:DoMatchParen` runtime toggle.
+    /// `:NoMatchParen` / `:DoMatchParen` runtime toggle (copy-on-write).
     pub fn set_matchparen_enabled(&self, on: bool) {
-        self.gopts.borrow_mut().matchparen_enabled = on;
+        let mut g = (**self.gopts.borrow()).clone();
+        g.matchparen_enabled = on;
+        *self.gopts.borrow_mut() = Rc::new(g);
     }
 
     /// The derived filetype config for `buf` (default when none was applied).

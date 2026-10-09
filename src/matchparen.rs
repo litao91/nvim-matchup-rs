@@ -17,17 +17,49 @@ use crate::words::{Side, SideQuery};
 
 type SharedState = Rc<State>;
 
-/// Temporary file-based tracing (err_writeln raises inside callbacks).
-pub fn trace(msg: &str) {
-    use std::io::Write;
-    if std::env::var("MRS_TRACE").is_ok() {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/mrs_trace.log")
-        {
-            let _ = writeln!(f, "{msg}");
+thread_local! {
+    /// Cached `MRS_TRACE` check (-1 = not yet read): avoids an env lookup per
+    /// trace call on the hot highlight/motion paths.
+    static TRACE_ENABLED: std::cell::Cell<i8> = std::cell::Cell::new(-1);
+}
+
+/// Whether `MRS_TRACE` file tracing is on (env read once, then cached).
+pub fn trace_enabled() -> bool {
+    TRACE_ENABLED.with(|c| {
+        let v = c.get();
+        if v >= 0 {
+            return v != 0;
         }
+        let on = std::env::var("MRS_TRACE").is_ok();
+        c.set(on as i8);
+        on
+    })
+}
+
+/// Write a pre-built trace line (no-op unless `MRS_TRACE` is set). Prefer
+/// `trace_with` so the message - and any FFI calls it needs - is built lazily.
+pub fn trace(msg: &str) {
+    if trace_enabled() {
+        trace_write(msg);
+    }
+}
+
+/// Lazy trace: `f` (and any `win.get_cursor()`/`ctx.cursor()` FFI it evaluates)
+/// runs ONLY when `MRS_TRACE` is set, so disabled tracing costs nothing.
+pub fn trace_with(f: impl FnOnce() -> String) {
+    if trace_enabled() {
+        trace_write(&f());
+    }
+}
+
+fn trace_write(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/mrs_trace.log")
+    {
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -170,7 +202,7 @@ pub fn setup(state: &SharedState) {
 /// Port of s:matchparen.highlight (matchparen.vim:332).
 pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     let g = ctx.gopts;
-    let tr = |why: &str| trace(&format!("HL early-out: {why}"));
+    let tr = |why: &str| trace_with(|| format!("HL early-out: {why}"));
     if !g.matchparen_enabled {
         tr("disabled");
         return;
@@ -340,7 +372,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         }
     }
 
-    trace(&format!("HL rendering {} delims", ml.len()));
+    trace_with(|| format!("HL rendering {} delims", ml.len()));
     // pass the seed's list entry: its match_index is the list position,
     // while `current` (from get_current) still has match_index 0
     let seed_entry = ml.delims[ml.seed_index()].clone();

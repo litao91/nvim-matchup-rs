@@ -37,13 +37,15 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
     }
     // nvim_win_set_cursor: line is 1-based, col is 0-based
     let r = win.set_cursor(p.lnum, cnum.saturating_sub(1));
-    crate::matchparen::trace(&format!(
-        "set_cursor({},{}) -> {:?} now {:?}",
-        p.lnum,
-        cnum,
-        r.as_ref().err().map(|e| format!("{e:?}")),
-        win.get_cursor()
-    ));
+    crate::matchparen::trace_with(|| {
+        format!(
+            "set_cursor({},{}) -> {:?} now {:?}",
+            p.lnum,
+            cnum,
+            r.as_ref().err().map(|e| format!("{e:?}")),
+            win.get_cursor()
+        )
+    });
 }
 
 /// Port of matchup#motion_force (matchup.vim:167).
@@ -170,14 +172,16 @@ fn seed_index(ml: &MatchingList) -> usize {
 
 /// Port of matchup#motion#find_matching_pair (motion.vim:24).
 pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
-    use crate::matchparen::trace;
+    use crate::matchparen::{trace, trace_with};
     let vars = read_vars(ctx);
-    trace(&format!(
-        "FMP start visual={visual} down={down} count={} count1={} op={vars:?} cursor={:?}",
-        vars.count,
-        vars.count1,
-        ctx.cursor()
-    ));
+    trace_with(|| {
+        format!(
+            "FMP start visual={visual} down={down} count={} count1={} op={vars:?} cursor={:?}",
+            vars.count,
+            vars.count1,
+            ctx.cursor()
+        )
+    });
     let force = motion_force();
     let is_oper = !vars.operator.is_empty();
 
@@ -225,10 +229,12 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
             }
         }
     };
-    trace(&format!(
-        "FMP delim {} {} {:?} side={:?}",
-        delim.lnum, delim.cnum, delim.match_, delim.side
-    ));
+    trace_with(|| {
+        format!(
+            "FMP delim {} {} {:?} side={:?}",
+            delim.lnum, delim.cnum, delim.match_, delim.side
+        )
+    });
 
     let ml = engine::get_matching(
         ctx,
@@ -243,7 +249,7 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
     } else {
         2
     };
-    trace(&format!("FMP ml len {}", ml.len()));
+    trace_with(|| format!("FMP ml len {}", ml.len()));
     if ml.len() < min_len {
         trace("FMP ml too short");
         return false;
@@ -251,7 +257,7 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
 
     // walk links count1 times
     let mut idx = seed_index(&ml);
-    trace(&format!("FMP seed_idx {idx}"));
+    trace_with(|| format!("FMP seed_idx {idx}"));
     delim.match_index = ml.delims[idx].match_index;
     for _ in 0..vars.count1 {
         idx = if down {
@@ -261,10 +267,12 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
         };
     }
     let target: Delim = ml.delims[idx].clone();
-    trace(&format!(
-        "FMP target {} {} {:?} side={:?} idx={idx}",
-        target.lnum, target.cnum, target.match_, target.side
-    ));
+    trace_with(|| {
+        format!(
+            "FMP target {} {} {:?} side={:?} idx={idx}",
+            target.lnum, target.cnum, target.match_, target.side
+        )
+    });
 
     if visual && is_oper {
         ensure_visual();
@@ -366,13 +374,13 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
         normal("o");
     }
 
-    trace(&format!("FMP set_cursor ({lnum},{column})"));
+    trace_with(|| format!("FMP set_cursor ({lnum},{column})"));
     set_cursor(&mut win, ctx, Pos::new(lnum, column));
-    trace(&format!("FMP after set_cursor: {:?}", ctx.cursor()));
+    trace_with(|| format!("FMP after set_cursor: {:?}", ctx.cursor()));
 
     if vars.foldopen.contains("percent") {
         normal("zv");
-        trace(&format!("FMP after zv: {:?}", ctx.cursor()));
+        trace_with(|| format!("FMP after zv: {:?}", ctx.cursor()));
     }
     true
 }
