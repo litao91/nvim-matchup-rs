@@ -152,6 +152,27 @@ pub(crate) fn with_ctx_for<R>(
     Some(f(&ctx))
 }
 
+/// Run a motion; if it made no progress while an operator is pending, feed
+/// <esc> so vim does not hang waiting for a motion. Shared by the exported Lua
+/// motion functions and the native keymap callbacks registered in
+/// `motion::setup`.
+pub(crate) fn run_motion(state: &SharedState, name: &str, f: impl Fn(&Ctx) -> bool) {
+    guard(name, || {
+        with_ctx(state, |ctx| {
+            let moved = f(ctx);
+            if !moved {
+                let m: String = nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+                    .unwrap_or_default();
+                if m.starts_with("no") {
+                    let k = nvim_oxi::String::from("\x1b");
+                    let md = nvim_oxi::String::from("n");
+                    api::feedkeys(&k, &md, false);
+                }
+            }
+        });
+    });
+}
+
 /// One-time activation, guarded by Rust state (`State.activated`): highlight
 /// groups, neutralize matchit / the bundled pi_paren, and define the user
 /// commands. The globals it touches belong to *other* plugins (matchit,
@@ -495,27 +516,9 @@ fn matchup_rs() -> Result<Dictionary> {
         Ok(())
     });
 
-    // ---- motions & text objects (called from <cmd> keymap rhs) ----
-
-    /// Run a motion; if it made no progress while an operator is pending,
-    /// feed <esc> so vim does not hang waiting for a motion.
-    fn run_motion(state: &SharedState, name: &str, f: impl Fn(&Ctx) -> bool) {
-        guard(name, || {
-            with_ctx(state, |ctx| {
-                let moved = f(ctx);
-                if !moved {
-                    let m: String =
-                        nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-                            .unwrap_or_default();
-                    if m.starts_with("no") {
-                        let k = nvim_oxi::String::from("\x1b");
-                        let md = nvim_oxi::String::from("n");
-                        api::feedkeys(&k, &md, false);
-                    }
-                }
-            });
-        });
-    }
+    // ---- motions & text objects (exported for the bench harness and direct
+    // `:lua` calls; the keymaps themselves use native callbacks registered in
+    // motion::setup, which call the module-level run_motion) ----
 
     let s = Rc::clone(&state);
     let motion_matching: Function<(i64, i64), ()> =

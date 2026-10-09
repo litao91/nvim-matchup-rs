@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
+use nvim_oxi::api;
 use nvim_oxi::{Array, Object};
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts, SurroundOpts};
@@ -780,13 +780,20 @@ pub fn op_motion(ctx: &Ctx, plug: &str) {
     *ctx.state.op_operator.borrow_mut() = String::new();
 }
 
-fn map_rhs(mode: Mode, mode_s: &str, plug_suffix: &str, rhs: &str, default_lhs: Option<&str>) {
-    let opts = SetKeymapOpts::builder().noremap(true).silent(true).build();
+/// Register a motion mapping backed by a native Rust callback (a real LuaRef
+/// via `nvim_set_keymap`), replacing the old `<cmd>lua …<cr>` string rhs.
+/// `factory` is called once per lhs - the `<Plug>` and, when it is free, the
+/// default lhs - because each mapping needs its own LuaRef.
+fn map_cb<F, B>(mode_s: &str, plug_suffix: &str, default_lhs: Option<&str>, desc: &str, factory: F)
+where
+    F: Fn() -> B,
+    B: Fn() + 'static,
+{
     let plug = format!("<Plug>(matchup-{plug_suffix})");
-    let _ = api::set_keymap(mode, &plug, rhs, &opts);
+    crate::nvimrs::set_keymap_cb(mode_s, &plug, desc, factory());
     if let Some(lhs) = default_lhs {
         if lhs_free(lhs, mode_s) {
-            let _ = api::set_keymap(mode, lhs, rhs, &opts);
+            crate::nvimrs::set_keymap_cb(mode_s, lhs, desc, factory());
         }
     }
 }
@@ -797,67 +804,182 @@ pub fn setup(state: &SharedState) {
         return;
     }
 
-    // NOTE: rhs strings use <cmd> (no mode transition); LuaRef callbacks
-    // are broken on nvim 0.13-dev (registered but never invoked).
+    // Each mapping is a native Rust callback (a real LuaRef via
+    // nvim_set_keymap), not a `<cmd>lua …<cr>` string. The closures capture an
+    // Rc<State> and call the same runners the exported Lua functions use.
 
-    // % and g%
-    for (suffix, down) in [("%", 1), ("g%", 0)] {
-        let n_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(0,{down})<cr>");
-        let x_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(1,{down})<cr>");
-        let o_rhs = format!("<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>");
-        map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
-        map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
-        map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));
+    // % (down) and g% (up): find_matching_pair.
+    for (suffix, down) in [("%", true), ("g%", false)] {
+        let s = Rc::clone(state);
+        map_cb(
+            "n",
+            suffix,
+            Some(suffix),
+            "matchup: to matching delimiter",
+            move || {
+                let s = Rc::clone(&s);
+                move || {
+                    crate::run_motion(&s, "motion_matching", |ctx| {
+                        find_matching_pair(ctx, false, down)
+                    })
+                }
+            },
+        );
+        let s = Rc::clone(state);
+        map_cb(
+            "x",
+            suffix,
+            Some(suffix),
+            "matchup: to matching delimiter",
+            move || {
+                let s = Rc::clone(&s);
+                move || {
+                    crate::run_motion(&s, "motion_matching", |ctx| {
+                        find_matching_pair(ctx, true, down)
+                    })
+                }
+            },
+        );
+        let s = Rc::clone(state);
+        let plug = format!("matchup-{suffix}");
+        map_cb(
+            "o",
+            suffix,
+            Some(suffix),
+            "matchup: operator-pending match",
+            move || {
+                let s = Rc::clone(&s);
+                let plug = plug.clone();
+                move || {
+                    crate::guard("op_motion", || {
+                        crate::with_ctx(&s, |ctx| op_motion(ctx, &plug))
+                    });
+                }
+            },
+        );
     }
 
-    // ]% and [%
-    for (suffix, down) in [("]%", 1), ("[%", 0)] {
-        let n_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(0,{down})<cr>");
-        let x_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(1,{down})<cr>");
-        let o_rhs = format!("<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>");
-        map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
-        map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
-        map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));
+    // ]% (down) and [% (up): find_unmatched.
+    for (suffix, down) in [("]%", true), ("[%", false)] {
+        let s = Rc::clone(state);
+        map_cb(
+            "n",
+            suffix,
+            Some(suffix),
+            "matchup: to unmatched delimiter",
+            move || {
+                let s = Rc::clone(&s);
+                move || {
+                    crate::run_motion(&s, "motion_unmatched", |ctx| {
+                        find_unmatched(ctx, false, down, 750.0)
+                    })
+                }
+            },
+        );
+        let s = Rc::clone(state);
+        map_cb(
+            "x",
+            suffix,
+            Some(suffix),
+            "matchup: to unmatched delimiter",
+            move || {
+                let s = Rc::clone(&s);
+                move || {
+                    crate::run_motion(&s, "motion_unmatched", |ctx| {
+                        find_unmatched(ctx, true, down, 750.0)
+                    })
+                }
+            },
+        );
+        let s = Rc::clone(state);
+        let plug = format!("matchup-{suffix}");
+        map_cb(
+            "o",
+            suffix,
+            Some(suffix),
+            "matchup: operator-pending unmatched",
+            move || {
+                let s = Rc::clone(&s);
+                let plug = plug.clone();
+                move || {
+                    crate::guard("op_motion", || {
+                        crate::with_ctx(&s, |ctx| op_motion(ctx, &plug))
+                    });
+                }
+            },
+        );
     }
 
-    // z%
-    map_rhs(
-        Mode::Normal,
+    // z%: jump_inside.
+    let s = Rc::clone(state);
+    map_cb(
         "n",
         "z%",
-        "<cmd>lua require('matchup_rs').motion_jump_inside(0)<cr>",
         Some("z%"),
+        "matchup: inside next block",
+        move || {
+            let s = Rc::clone(&s);
+            move || crate::run_motion(&s, "motion_jump_inside", |ctx| jump_inside(ctx, false))
+        },
     );
-    map_rhs(
-        Mode::Visual,
+    let s = Rc::clone(state);
+    map_cb(
         "x",
         "z%",
-        "<cmd>lua require('matchup_rs').motion_jump_inside(1)<cr>",
         Some("z%"),
+        "matchup: inside next block",
+        move || {
+            let s = Rc::clone(&s);
+            move || crate::run_motion(&s, "motion_jump_inside", |ctx| jump_inside(ctx, true))
+        },
     );
-    map_rhs(
-        Mode::OperatorPending,
+    let s = Rc::clone(state);
+    map_cb(
         "o",
         "z%",
-        "<cmd>lua require('matchup_rs').op_motion('matchup-z%')<cr>",
         Some("z%"),
+        "matchup: operator-pending inside",
+        move || {
+            let s = Rc::clone(&s);
+            move || {
+                crate::guard("op_motion", || {
+                    crate::with_ctx(&s, |ctx| op_motion(ctx, "matchup-z%"))
+                });
+            }
+        },
     );
 
-    // Z% (<Plug> only, like the original)
-    map_rhs(
-        Mode::Normal,
+    // Z% (<Plug> only, like the original): jump_inside_prev.
+    let s = Rc::clone(state);
+    map_cb(
         "n",
         "Z%",
-        "<cmd>lua require('matchup_rs').motion_jump_inside_prev(0)<cr>",
         None,
+        "matchup: inside previous block",
+        move || {
+            let s = Rc::clone(&s);
+            move || {
+                crate::run_motion(&s, "motion_jump_inside_prev", |ctx| {
+                    jump_inside_prev(ctx, false)
+                })
+            }
+        },
     );
 
-    // insert mode <c-g>%
-    map_rhs(
-        Mode::Insert,
+    // insert-mode <c-g>%: insert_mode.
+    let s = Rc::clone(state);
+    map_cb(
         "i",
         "c_g%",
-        "<cmd>lua require('matchup_rs').motion_insert()<cr>",
         Some("<c-g>%"),
+        "matchup: to match (insert mode)",
+        move || {
+            let s = Rc::clone(&s);
+            move || {
+                crate::guard("motion_insert", || {
+                    crate::with_ctx(&s, |ctx| insert_mode(ctx))
+                });
+            }
+        },
     );
 }

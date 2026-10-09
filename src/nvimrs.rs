@@ -254,6 +254,32 @@ const _: () = assert!(std::mem::size_of::<KeyDictUserCommand>() == 256);
 const _: () = assert!(std::mem::offset_of!(KeyDictUserCommand, desc) == 112);
 const _: () = assert!(std::mem::offset_of!(KeyDictUserCommand, force) == 144);
 
+/// `KeyDict_keymap` (keysets_defs.h:84-95), field order = memory order.
+/// NOTE: `callback` is a bare `LuaRef` (= nvim `Integer`, i64), *not* a
+/// `Union(String, LuaRef)` Object like the autocmd/user-command callbacks - so
+/// it is 8 bytes at offset 16, and the six bools before it leave 2 pad bytes.
+#[repr(C)]
+struct KeyDictKeymap {
+    is_set: u64,
+    noremap: bool,
+    nowait: bool,
+    silent: bool,
+    script: bool,
+    expr: bool,
+    unique: bool,
+    callback: i64, // LuaRef
+    desc: CStr,
+    replace_keycodes: bool,
+}
+// Bit indices from keysets_defs.generated.h (KEYSET_OPTIDX_keymap__*).
+const OPTIDX_KEYMAP_DESC: u64 = 1;
+const OPTIDX_KEYMAP_SILENT: u64 = 4;
+const OPTIDX_KEYMAP_NOREMAP: u64 = 7;
+const OPTIDX_KEYMAP_CALLBACK: u64 = 8;
+const _: () = assert!(std::mem::size_of::<KeyDictKeymap>() == 48);
+const _: () = assert!(std::mem::offset_of!(KeyDictKeymap, callback) == 16);
+const _: () = assert!(std::mem::offset_of!(KeyDictKeymap, desc) == 24);
+
 unsafe extern "C" {
     fn nvim_eval(expr: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_call_function(
@@ -298,6 +324,14 @@ unsafe extern "C" {
         err: *mut CError,
     );
     fn nvim_del_user_command(name: CStr, err: *mut CError);
+    fn nvim_set_keymap(
+        channel_id: u64,
+        mode: CStr,
+        lhs: CStr,
+        rhs: CStr,
+        opts: *const KeyDictKeymap,
+        err: *mut CError,
+    );
     fn nvim_get_option_value(name: CStr, opts: *const KeyDictOption, err: *mut CError) -> Object;
     fn nvim_get_var(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_get_vvar(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
@@ -577,6 +611,58 @@ where
     opts.is_set |= 1 << OPTIDX_UCMD_DESC;
     let mut err = CError::new();
     unsafe { nvim_create_user_command(LUA_INTERNAL_CALL, cname, cmd, &opts, &mut err) };
+    !err.is_err()
+}
+
+/// Define a keymap whose handler is a native Rust callback (a bare `LuaRef`
+/// packed into the correctly-laid-out `KeyDict_keymap`), the equivalent of
+/// `nvim_set_keymap` with a Lua function rhs. `noremap` + `silent` are forced
+/// (mirroring the old `<cmd>` mappings). Keymap callbacks are invoked with no
+/// arguments (mapping.c: `Array args = ARRAY_DICT_INIT`), hence
+/// `Function<(), ()>`. nvim takes ownership of the ref (mapping.c:2802 sets
+/// `opts->callback = LUA_NOREF`) and oxi's `Function` has no `Drop`, so there
+/// is no double-unref; the ref lives until the mapping is deleted.
+pub fn set_keymap_cb<F>(mode: &str, lhs: &str, desc: &str, f: F) -> bool
+where
+    F: Fn() + 'static,
+{
+    use nvim_oxi::Function;
+    let func: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+        f();
+        Ok(())
+    });
+    // oxi's LuaRef is c_int (i32); nvim's keymap callback field is Integer (i64).
+    let luaref = func.lua_ref() as i64;
+
+    let (_mg, cmode) = match cstr(mode) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (_lg, clhs) = match cstr(lhs) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (_rg, crhs) = match cstr("") {
+        Some(x) => x,
+        None => return false,
+    };
+    let (_dg, cdesc) = match cstr(desc) {
+        Some(x) => x,
+        None => return false,
+    };
+
+    let mut opts: KeyDictKeymap = unsafe { std::mem::zeroed() };
+    opts.callback = luaref;
+    opts.is_set |= 1 << OPTIDX_KEYMAP_CALLBACK;
+    opts.desc = cdesc;
+    opts.is_set |= 1 << OPTIDX_KEYMAP_DESC;
+    opts.noremap = true;
+    opts.is_set |= 1 << OPTIDX_KEYMAP_NOREMAP;
+    opts.silent = true;
+    opts.is_set |= 1 << OPTIDX_KEYMAP_SILENT;
+
+    let mut err = CError::new();
+    unsafe { nvim_set_keymap(LUA_INTERNAL_CALL, cmode, clhs, crhs, &opts, &mut err) };
     !err.is_err()
 }
 
