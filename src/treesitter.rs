@@ -159,6 +159,17 @@ pub fn language(state: &State, lang: &str) -> Option<Language> {
     }
     let loaded = (|| -> Option<Language> {
         let path = find_parser(lang)?;
+        // SAFETY: `path` is a real treesitter parser `.so` found on the
+        // runtimepath. `Library::new` dlopens it and `lib.get` resolves the
+        // `tree_sitter_<lang>` symbol, which by the treesitter ABI is an
+        // `extern "C" fn() -> *const TSLanguage` - matching the annotated type,
+        // so `*func` is a valid function pointer and `LanguageFn::from_raw`
+        // wraps a genuine language fn. The `Library` is stored in `ts.libs`
+        // beside the returned `Language`, keeping the dylib (and the code/data
+        // its fn pointer references) loaded for as long as the Language lives.
+        // Residual risk is a malformed/incompatible parser `.so` on the rtp
+        // exporting a wrong-signature symbol - the same trust nvim itself places
+        // in runtimepath parsers.
         unsafe {
             let lib = Library::new(&path).ok()?;
             let sym = format!("tree_sitter_{}\0", sym_lang(lang));

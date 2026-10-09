@@ -16,6 +16,42 @@
 //! nvim-oxi's layout-compatible `Object`/`Array`/`Dictionary` for data.
 //! Everything else (handles, `get_var`, `win.get_cursor`, extmarks, ...) keeps
 //! using nvim-oxi, whose bindings for those are still correct.
+//!
+//! # Safety contract (every `unsafe` in this module)
+//!
+//! All `unsafe` here is either an FFI call into Neovim's C API or a
+//! `mem::zeroed` keyset, and each relies on the same invariants (restated
+//! briefly at the individual sites):
+//!
+//! * **ABI** - each `extern "C"` declaration matches nvim 0.13's true signature
+//!   (checked against `~/repos/neovim/build/include/api/*.h.generated.h`), and
+//!   every `KeyDict_*` layout is pinned by the compile-time `size_of!` /
+//!   `offset_of!` asserts below, so field offsets (notably the `Union(String,
+//!   LuaRef)` callbacks and the generator-added `is_set`) cannot silently drift
+//!   the way oxi 0.6's hardcoded 0.9/0.10 layouts do.
+//! * **String args** - passed as `CStr { data, size }` from `cstr()`, whose
+//!   backing `CString` is bound to a local guard (`_guard`/`_g`/...) that lives
+//!   until the end of the function, i.e. past the call, so `data` stays valid,
+//!   NUL-terminated and `size` bytes long for the whole call.
+//! * **Borrowed arrays** - `CArray::borrow` is a non-owning view of a live
+//!   `nvim_oxi::Array` that outlives the call; the view has no `Drop`, so nvim's
+//!   read of it cannot double-free.
+//! * **Return objects** - `arena` is `null`, so nvim allocates results with
+//!   `xmalloc`; the returned `Object`/`Array`/`String` is layout-compatible with
+//!   oxi's and frees that allocation on `Drop` (callers must not free it again).
+//! * **Error out-param** - `&mut err` points to a valid `CError` (etype -1 =
+//!   none) that only nvim writes. On error nvim allocates `err.msg`; we leak
+//!   that rare, small string instead of calling `api_clear_error` (a leak, not
+//!   UB).
+//! * **Channel / threading** - `LUA_INTERNAL_CALL` marks the call in-process,
+//!   which is correct because this code only runs on nvim's main thread inside a
+//!   Lua / autocmd / keymap / user-command callback (nvim's API is
+//!   main-thread-only, and the plugin never spawns threads).
+//! * **`mem::zeroed` keysets** - every `KeyDict_*` is `#[repr(C)]` and all-zero
+//!   is a valid value: `is_set = 0` (so nvim reads no optional field), bools
+//!   false, ints 0, `CStr { null, 0 }` (nvim's empty `String`), and an `Object`
+//!   type-tag of 0 == `kObjectTypeNil`. Optional fields are only read when we
+//!   explicitly set their `is_set` bit.
 
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
@@ -280,6 +316,12 @@ const _: () = assert!(std::mem::size_of::<KeyDictKeymap>() == 48);
 const _: () = assert!(std::mem::offset_of!(KeyDictKeymap, callback) == 16);
 const _: () = assert!(std::mem::offset_of!(KeyDictKeymap, desc) == 24);
 
+// SAFETY: these declarations mirror nvim 0.13's exported C ABI (checked against
+// the generated api headers, with every KeyDict_* layout pinned by the asserts
+// above). Calling them is `unsafe`; each wrapper below upholds the module-level
+// Safety contract - CStr/array args backed by locals that outlive the call, a
+// valid `&mut` error out-param, null arena (returned objects own nvim's alloc),
+// main-thread only, and LUA_INTERNAL_CALL where a channel id is taken.
 unsafe extern "C" {
     fn nvim_eval(expr: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_call_function(
@@ -356,6 +398,9 @@ fn cstr(s: &str) -> Option<(CString, CStr)> {
 pub fn eval(expr: &str) -> Option<Object> {
     let (_guard, cexpr) = cstr(expr)?;
     let mut err = CError::new();
+    // SAFETY: module contract; `cexpr` is backed by `_guard` (outlives the
+    // call), `err` is a valid &mut, arena null so the returned Object owns and
+    // frees nvim's allocation on Drop.
     let obj = unsafe { nvim_eval(cexpr, ptr::null_mut(), &mut err) };
     if err.is_err() {
         return None;
@@ -374,6 +419,9 @@ pub fn call_function(name: &str, args: &Array) -> Option<Object> {
     let (_guard, cname) = cstr(name)?;
     let cargs = CArray::borrow(args);
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_guard`, `cargs` borrows
+    // the live `args` Array (non-owning view, no Drop), `err` is a valid &mut,
+    // arena null so the returned Object owns nvim's allocation.
     let obj =
         unsafe { nvim_call_function(LUA_INTERNAL_CALL, cname, cargs, ptr::null_mut(), &mut err) };
     if err.is_err() {
@@ -396,9 +444,13 @@ pub fn call_fn0_as<V: FromObject>(name: &str) -> Option<V> {
 pub fn echo(text: &str) {
     let chunks = Array::from_iter([Object::from(Array::from_iter([Object::from(text)]))]);
     let cchunks = CArray::borrow(&chunks);
-    // zeroed echo opts -> all defaults
+    // SAFETY: all-zero `KeyDictEchoOpts` is a valid value (is_set = 0, so nvim
+    // reads no optional field); see the module Safety contract.
     let opts: KeyDictEchoOpts = unsafe { std::mem::zeroed() };
     let mut err = CError::new();
+    // SAFETY: module contract; `cchunks` borrows the live `chunks` local, opts
+    // and err are valid pointers, and the returned Object (`_ret`) owns and
+    // frees nvim's allocation when it drops at the end of this function.
     let _ret = unsafe { nvim_echo(cchunks, true, &opts, &mut err) };
     // _ret (Object) drops here, freeing nvim's allocation.
 }
@@ -412,6 +464,9 @@ pub fn get_option_value(name: &str, buf: i32, win: i32) -> Option<Object> {
 fn get_option_scoped(name: &str, scope: &str, buf: i32, win: i32) -> Option<Object> {
     let (_guard, cname) = cstr(name)?;
     let (_sguard, cscope) = cstr(scope)?;
+    // SAFETY: all-zero `KeyDictOption` is valid (is_set = 0); the optional
+    // scope/buf/win fields are set below only alongside their is_set bits, and
+    // `cscope` is backed by `_sguard` which outlives the call. Module contract.
     let mut opts: KeyDictOption = unsafe { std::mem::zeroed() };
     if !scope.is_empty() {
         opts.scope = cscope;
@@ -426,6 +481,9 @@ fn get_option_scoped(name: &str, scope: &str, buf: i32, win: i32) -> Option<Obje
         opts.is_set |= 1 << OPTIDX_OPTION_WIN;
     }
     let mut err = CError::new();
+    // SAFETY: module contract; `cname`/`opts.scope` are backed by locals that
+    // outlive the call, `opts`/`err` are valid pointers, returned Object owns
+    // nvim's allocation.
     let obj = unsafe { nvim_get_option_value(cname, &opts, &mut err) };
     if err.is_err() {
         return None;
@@ -448,6 +506,8 @@ pub fn get_option_local_as<V: FromObject>(name: &str, win: i32) -> Option<V> {
 pub fn get_var_as<V: FromObject>(name: &str) -> Option<V> {
     let (_g, cname) = cstr(name)?;
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_g` (outlives the call),
+    // `err` is a valid &mut, arena null so the returned Object owns nvim's alloc.
     let obj = unsafe { nvim_get_var(cname, ptr::null_mut(), &mut err) };
     if err.is_err() {
         None
@@ -460,6 +520,8 @@ pub fn get_var_as<V: FromObject>(name: &str) -> Option<V> {
 pub fn get_vvar_as<V: FromObject>(name: &str) -> Option<V> {
     let (_g, cname) = cstr(name)?;
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_g`, `err` is a valid &mut,
+    // arena null so the returned Object owns nvim's allocation.
     let obj = unsafe { nvim_get_vvar(cname, ptr::null_mut(), &mut err) };
     if err.is_err() {
         None
@@ -472,6 +534,9 @@ pub fn get_vvar_as<V: FromObject>(name: &str) -> Option<V> {
 pub fn buf_get_var_as<V: FromObject>(buf: i32, name: &str) -> Option<V> {
     let (_g, cname) = cstr(name)?;
     let mut err = CError::new();
+    // SAFETY: module contract; `buf` is a valid handle, `cname` is backed by
+    // `_g`, `err` is a valid &mut, arena null so the returned Object owns
+    // nvim's allocation.
     let obj = unsafe { nvim_buf_get_var(buf, cname, ptr::null_mut(), &mut err) };
     if err.is_err() {
         None
@@ -484,6 +549,8 @@ pub fn buf_get_var_as<V: FromObject>(buf: i32, name: &str) -> Option<V> {
 pub fn get_runtime_file(name: &str, all: bool) -> Option<Array> {
     let (_g, cname) = cstr(name)?;
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_g`, `err` is a valid &mut,
+    // arena null so the returned Array owns and frees nvim's allocation.
     let arr = unsafe { nvim_get_runtime_file(cname, all, ptr::null_mut(), &mut err) };
     if err.is_err() {
         None
@@ -516,6 +583,11 @@ where
     opts.is_set |= 1 << OPTIDX_AUTOCMD_PATTERN;
 
     let mut err = CError::new();
+    // SAFETY: module contract; `event`/`opts.pattern`/`opts.group` are owned
+    // Objects valid for the call, `opts` is a KeyDictCreateAutocmd whose layout
+    // is compile-time asserted, its `callback` is a LuaRef Object that nvim
+    // adopts (oxi's Object does not unref a LuaRef on Drop, so no double-free),
+    // `err` is a valid &mut, and arena is null.
     let id =
         unsafe { nvim_create_autocmd(LUA_INTERNAL_CALL, event, &opts, ptr::null_mut(), &mut err) };
     !err.is_err() && id > 0
@@ -539,6 +611,10 @@ pub fn create_autocmd_cmd(events: &[&str], group: i32, pattern: &str, command: &
     opts.pattern = Object::from(pattern.to_string());
     opts.is_set |= 1 << OPTIDX_AUTOCMD_PATTERN;
     let mut err = CError::new();
+    // SAFETY: module contract; `opts.command` (`ccmd`) is backed by `_cmd_guard`
+    // (outlives the call) and nvim copies it, `event`/pattern/group are owned
+    // Objects, `opts` layout is compile-time asserted, `err` is a valid &mut,
+    // arena null.
     let id =
         unsafe { nvim_create_autocmd(LUA_INTERNAL_CALL, event, &opts, ptr::null_mut(), &mut err) };
     !err.is_err() && id > 0
@@ -549,12 +625,16 @@ pub fn create_autocmd_cmd(events: &[&str], group: i32, pattern: &str, command: &
 /// `if exists('#User#X') | doautocmd <nomodeline> User X | endif`.
 pub fn exec_user_autocmd(name: &str) {
     let event = Object::from("User");
+    // SAFETY: all-zero KeyDictExecAutocmds is valid (is_set = 0); module contract.
     let mut opts: KeyDictExecAutocmds = unsafe { std::mem::zeroed() };
     opts.pattern = Object::from(name.to_string());
     opts.is_set |= 1 << OPTIDX_EXEC_AUTOCMDS_PATTERN;
     opts.modeline = false; // <nomodeline>
     opts.is_set |= 1 << OPTIDX_EXEC_AUTOCMDS_MODELINE;
     let mut err = CError::new();
+    // SAFETY: module contract; `event`/`opts.pattern` are owned Objects valid for
+    // the call, `opts` layout is compile-time asserted, `err` is a valid &mut,
+    // arena null (this call returns no object).
     unsafe { nvim_exec_autocmds(event, &opts, ptr::null_mut(), &mut err) };
 }
 
@@ -568,6 +648,8 @@ pub fn set_hl_link(name: &str, target: &str) {
         None => return,
     };
     let mut err = CError::new();
+    // SAFETY: module contract; `ctarget` is backed by `_tguard` (outlives the
+    // call) and `err` is a valid &mut. Returns an HLGroupID (i64).
     let id = unsafe { nvim_get_hl_id_by_name(ctarget, &mut err) };
     if err.is_err() {
         return;
@@ -576,12 +658,20 @@ pub fn set_hl_link(name: &str, target: &str) {
         Some(x) => x,
         None => return,
     };
+    // SAFETY: all-zero KeyDictHighlight is valid - is_set = 0, bools false, the
+    // nested KeyDictHighlightCterm is itself all-zero (its own is_set = 0), and
+    // the String/Object/Integer fields are zero-valid (Nil/empty). Layout is
+    // compile-time asserted; only `link`/`default_` are set below, each with its
+    // is_set bit.
     let mut val: KeyDictHighlight = unsafe { std::mem::zeroed() };
     val.link = id;
     val.is_set |= 1 << OPTIDX_HL_LINK;
     val.default_ = true;
     val.is_set |= 1 << OPTIDX_HL_DEFAULT;
     let mut err = CError::new();
+    // SAFETY: module contract; ns_id 0 = global namespace, `cname` is backed by
+    // `_nguard`, `val` is a valid asserted-layout KeyDictHighlight, `err` is a
+    // valid &mut.
     unsafe { nvim_set_hl(LUA_INTERNAL_CALL, 0, cname, &val, &mut err) };
 }
 
@@ -604,12 +694,17 @@ where
         Some(x) => x,
         None => return false,
     };
+    // SAFETY: all-zero KeyDictUserCommand is valid (is_set = 0, Object fields
+    // Nil, bools false); layout is compile-time asserted. Module contract.
     let mut opts: KeyDictUserCommand = unsafe { std::mem::zeroed() };
     opts.force = true;
     opts.is_set |= 1 << OPTIDX_UCMD_FORCE;
     opts.desc = Object::from(desc.to_string());
     opts.is_set |= 1 << OPTIDX_UCMD_DESC;
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_ng`, `cmd` is a LuaRef
+    // Object nvim adopts (oxi's Object does not unref a LuaRef on Drop, so no
+    // double-free), `opts` layout is asserted, `err` is a valid &mut.
     unsafe { nvim_create_user_command(LUA_INTERNAL_CALL, cname, cmd, &opts, &mut err) };
     !err.is_err()
 }
@@ -651,6 +746,10 @@ where
         None => return false,
     };
 
+    // SAFETY: all-zero KeyDictKeymap is a valid bit pattern (is_set = 0, so nvim
+    // reads no optional field yet; bools false; `desc` = empty CStr; the bare i64
+    // `callback` is overwritten below before the call). Layout is compile-time
+    // asserted. Module contract.
     let mut opts: KeyDictKeymap = unsafe { std::mem::zeroed() };
     opts.callback = luaref;
     opts.is_set |= 1 << OPTIDX_KEYMAP_CALLBACK;
@@ -662,6 +761,11 @@ where
     opts.is_set |= 1 << OPTIDX_KEYMAP_SILENT;
 
     let mut err = CError::new();
+    // SAFETY: module contract; `cmode`/`clhs`/`crhs`/`cdesc` are backed by their
+    // `_mg`/`_lg`/`_rg`/`_dg` guards (all outlive the call), `opts.callback` is a
+    // LuaRef nvim adopts (mapping.c sets `opts->callback = LUA_NOREF`; oxi's
+    // Function has no Drop, so no double-unref), `opts` layout is asserted, and
+    // `err` is a valid &mut.
     unsafe { nvim_set_keymap(LUA_INTERNAL_CALL, cmode, clhs, crhs, &opts, &mut err) };
     !err.is_err()
 }
@@ -674,5 +778,7 @@ pub fn del_user_command(name: &str) {
         None => return,
     };
     let mut err = CError::new();
+    // SAFETY: module contract; `cname` is backed by `_g` (outlives the call) and
+    // `err` is a valid &mut. A missing command only sets `err`, which we ignore.
     unsafe { nvim_del_user_command(cname, &mut err) };
 }
