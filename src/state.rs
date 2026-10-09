@@ -556,6 +556,10 @@ pub struct State {
     pub eff_curpos: Cell<(i64, i64)>,
     /// Offscreen-statusline scroll-refresh timer id (replaces `s:scroll_timer`).
     pub scroll_timer: Cell<Option<i64>>,
+    /// Single-slot cache of the last fetched buffer-lines snapshot, keyed by
+    /// (bufnr, changedtick, window); see `engine::snapshot_for`. Lets repeated
+    /// ops on an unchanged buffer skip the whole-buffer fetch+copy.
+    pub snapshot: RefCell<Option<crate::engine::Snap>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -593,6 +597,7 @@ impl State {
             activated: Cell::new(false),
             eff_curpos: Cell::new((1, 1)),
             scroll_timer: Cell::new(None),
+            snapshot: RefCell::new(None),
         }
     }
 
@@ -600,6 +605,7 @@ impl State {
         self.bufs.borrow_mut().clear();
         self.expr_cache.borrow_mut().clear();
         self.surround_memo.borrow_mut().clear();
+        *self.snapshot.borrow_mut() = None;
         crate::treesitter::invalidate(self, None);
     }
 
@@ -608,6 +614,15 @@ impl State {
         self.bufs.borrow_mut().remove(&bufnr);
         self.surround_memo.borrow_mut().remove(&bufnr);
         self.ft_config.borrow_mut().remove(&bufnr);
+        let snap_is_this = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .map(|s| s.bufnr == bufnr)
+            .unwrap_or(false);
+        if snap_is_this {
+            *self.snapshot.borrow_mut() = None;
+        }
         crate::treesitter::invalidate(self, Some(bufnr));
     }
 

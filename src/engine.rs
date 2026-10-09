@@ -4,6 +4,7 @@
 //! buffer text fetched once per operation.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fancy_regex::Regex;
 use nvim_oxi::api::{Buffer, Window as NvimWindow};
@@ -51,19 +52,6 @@ impl Lines {
         }
     }
 
-    pub fn fetch_for_cursor(buf: &Buffer, cursor_lnum: usize, margin: usize) -> Lines {
-        let total = buf.line_count().unwrap_or(0);
-        if total <= FULL_FETCH_LIMIT {
-            Lines::fetch(buf, 1, total)
-        } else {
-            Lines::fetch(
-                buf,
-                cursor_lnum.saturating_sub(margin).max(1),
-                cursor_lnum + margin,
-            )
-        }
-    }
-
     pub fn get1(&self, lnum: usize) -> Option<&str> {
         let i = lnum.checked_sub(self.start0 + 1)?;
         self.lines.get(i).map(|s| s.as_str())
@@ -72,6 +60,56 @@ impl Lines {
     pub fn max_lnum(&self) -> usize {
         self.start0 + self.lines.len()
     }
+}
+
+/// A cached buffer-lines snapshot, keyed by `(bufnr, changedtick, window)`.
+/// Held in `State.snapshot` (a single slot) so repeated ops on an unchanged
+/// buffer - highlight on every `CursorMoved`, or a motion right after - reuse
+/// one fetch instead of re-copying the whole buffer each call.
+pub struct Snap {
+    pub bufnr: i32,
+    pub tick: u32,
+    pub from1: usize,
+    pub to1: usize,
+    pub lines: Rc<Lines>,
+}
+
+/// Fetch (or reuse) the line snapshot for `buf`. Mirrors the old
+/// `Lines::fetch_for_cursor` policy exactly: the full buffer when
+/// `total <= FULL_FETCH_LIMIT`, else a `+/-margin` window around the cursor.
+/// The window range is part of the cache key, so a cursor move only re-fetches
+/// for windowed (>20k) buffers; for the common full-fetch case the snapshot is
+/// cursor-independent and is reused across cursor moves until the text changes
+/// (`changedtick`). A failed fetch is never cached, so it self-heals next op.
+pub fn snapshot_for(state: &State, buf: &Buffer, win: &NvimWindow, margin: usize) -> Rc<Lines> {
+    let total = buf.line_count().unwrap_or(0);
+    let tick = buf.get_changedtick().unwrap_or(0);
+    let bufnr = buf.handle();
+    let (from1, to1) = if total <= FULL_FETCH_LIMIT {
+        (1, total)
+    } else {
+        let cursor = win.get_cursor().map(|(r, _)| r).unwrap_or(1);
+        (cursor.saturating_sub(margin).max(1), cursor + margin)
+    };
+    {
+        let cache = state.snapshot.borrow();
+        if let Some(snap) = cache.as_ref() {
+            if snap.bufnr == bufnr && snap.tick == tick && snap.from1 == from1 && snap.to1 == to1 {
+                return Rc::clone(&snap.lines);
+            }
+        }
+    }
+    let lines = Rc::new(Lines::fetch(buf, from1, to1));
+    if !(total > 0 && lines.lines.is_empty()) {
+        *state.snapshot.borrow_mut() = Some(Snap {
+            bufnr,
+            tick,
+            from1,
+            to1,
+            lines: Rc::clone(&lines),
+        });
+    }
+    lines
 }
 
 fn bound_up(line: &str, mut p: usize) -> usize {
@@ -102,7 +140,7 @@ pub struct Ctx<'a> {
     pub buf: Buffer,
     pub win: NvimWindow,
     pub gopts: &'a GOpts,
-    pub lines: Lines,
+    pub lines: Rc<Lines>,
     pub mode: String,
     pub synmaxcol: i64,
     /// Whether vim syntax highlighting is loaded (`g:syntax_on`); when
@@ -120,10 +158,11 @@ impl<'a> Ctx<'a> {
         win: NvimWindow,
         gopts: &'a GOpts,
     ) -> Ctx<'a> {
-        // nvim_win_get_cursor: line is 1-based, col is 0-based
-        let cursor = win.get_cursor().map(|(r, _)| r).unwrap_or(1);
+        // Line snapshot, cached per (changedtick, window) in State; the margin
+        // only matters for >FULL_FETCH_LIMIT buffers, where the fetch is
+        // windowed around the cursor.
         let margin = gopts.delim_stopline.max(gopts.matchparen_stopline) + 100;
-        let lines = Lines::fetch_for_cursor(&buf, cursor, margin);
+        let lines = snapshot_for(state, &buf, &win, margin);
         let mode: String =
             crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
                 .unwrap_or_else(|| "n".to_string());
