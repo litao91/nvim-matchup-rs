@@ -25,7 +25,10 @@ RUNTIME = '/mnt/data/local/share/nvim/runtime'
 SIZES = [
     ('2k', 2_000, 50),
     ('10k', 10_000, 30),
-    ('50k', 50_000, 15),
+    # 50k iters kept low: the original engine's surrounding_deep is ~1-89s per
+    # call there, so 15 iters alone can exceed an hour; 6 (3 for the real corpus)
+    # gives a stable median while keeping a full run bounded.
+    ('50k', 50_000, 6),
 ]
 
 
@@ -164,7 +167,7 @@ def main():
     with open(os.path.join(OUT, name), 'w') as fh:
         fh.write('\n'.join(lines) + '\n')
     positions[name] = {
-        'ft': 'vim', 'lines': len(lines), 'iters': 15,
+        'ft': 'vim', 'lines': len(lines), 'iters': 3,
         'outer': outer, 'middle': middle, 'deep': deep,
     }
     print('%-22s %7d lines' % (name, len(lines)))

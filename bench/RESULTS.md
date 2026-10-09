@@ -19,154 +19,117 @@ Classic-engine Rust rewrite (nvim-oxi + fancy-regex) vs the original vim-matchup
   - `surrounding_deep`: get_surrounding from the target line inside the outermost block (walks back past every sibling block)
   - `highlight`: full matchparen cycle incl. extmark writes (cursor alternates between two positions per iteration)
   - `motion_unmatched`: `[%`-style motion from the target line (cursor reset each iteration, outside the timed region)
-- 1 warm-up iteration, then 50 (2k files) / 30 (10k) / 15 (50k and real file) timed iterations via `vim.uv.hrtime()`; median and p95 reported
+- 1 warm-up iteration, then 50 (2k files) / 30 (10k) / 6 (50k) / 3 (real 50k file) timed iterations via `vim.uv.hrtime()`; median and p95 reported. The 50k counts are low because the original engine's surrounding_deep costs ~1-89s per call there, so more iterations would not finish
 - raw engine ops run with the timeout budget disabled on both sides (`matchup#perf#timeout_start(0)`); highlight and motion use their normal budgets
 
 ## nested_c_10k.c
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.31 | 1.42 | 0.2x | 0.43 | 2.19 |
-| matching_middle | 0.31 | 1.43 | 0.2x | 0.44 | 1.52 |
-| surrounding_deep | 746.79 | 6.30 | 118.5x | 2,466.27 | 6.68 |
-| highlight | 0.50 | 1.42 | 0.4x | 0.57 | 1.61 |
-| motion_unmatched | 714.30 | 8.49 | 84.1x | 758.32 | 9.44 |
+| matching_outer | 0.29 | 1.74 | 0.2x | 0.49 | 2.64 |
+| matching_middle | 0.27 | 1.78 | 0.2x | 0.39 | 2.33 |
+| surrounding_deep | 585.95 | 70.07 | 8.4x | 734.91 | 78.78 |
+| highlight | 0.73 | 2.24 | 0.3x | 1.04 | 3.07 |
+| motion_unmatched | 636.23 | 66.18 | 9.6x | 754.31 | 79.77 |
 
 ## nested_c_2k.c
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.32 | 0.36 | 0.9x | 0.40 | 0.58 |
-| matching_middle | 0.31 | 0.36 | 0.9x | 0.38 | 0.65 |
-| surrounding_deep | 196.05 | 1.51 | 130.2x | 956.73 | 1.74 |
-| highlight | 1.25 | 0.37 | 3.3x | 10.76 | 0.51 |
-| motion_unmatched | 155.71 | 2.12 | 73.5x | 236.96 | 3.62 |
+| matching_outer | 0.29 | 0.40 | 0.7x | 0.42 | 0.62 |
+| matching_middle | 0.29 | 0.42 | 0.7x | 0.38 | 0.66 |
+| surrounding_deep | 125.14 | 16.72 | 7.5x | 149.13 | 20.28 |
+| highlight | 0.49 | 0.39 | 1.3x | 0.74 | 0.49 |
+| motion_unmatched | 131.92 | 19.33 | 6.8x | 161.04 | 25.40 |
 
 ## nested_c_50k.c
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.29 | 0.31 | 0.9x | 0.42 | 0.38 |
-| matching_middle | 0.29 | 0.58 | 0.5x | 0.36 | 1.21 |
-| surrounding_deep | 5,242.99 | 1.20 | 4,365.1x | 16,092.53 | 2.00 |
-| highlight | 0.65 | 0.38 | 1.7x | 1.20 | 0.64 |
-| motion_unmatched | 756.32 | 1.56 | 483.4x | 758.65 | 2.53 |
+| matching_outer | 0.28 | 0.32 | 0.9x | 0.36 | 0.34 |
+| matching_middle | 0.28 | 0.76 | 0.4x | 0.49 | 0.83 |
+| surrounding_deep | 4,319.51 | 11.14 | 387.6x | 4,548.03 | 13.68 |
+| highlight | 0.59 | 0.38 | 1.5x | 0.68 | 0.93 |
+| motion_unmatched | 755.37 | 12.06 | 62.6x | 756.02 | 16.32 |
 
 ## nested_lua_10k.lua
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.36 | 2.04 | 0.2x | 0.54 | 2.78 |
-| matching_middle | 2.86 | 1.93 | 1.5x | 3.39 | 2.19 |
-| surrounding_deep | 637.67 | 12.02 | 53.1x | 854.06 | 14.34 |
-| highlight | 0.60 | 2.04 | 0.3x | 3.29 | 2.70 |
-| motion_unmatched | 756.31 | 17.70 | 42.7x | 766.69 | 19.28 |
+| matching_outer | 0.27 | 2.27 | 0.1x | 0.32 | 2.89 |
+| matching_middle | 2.32 | 2.45 | 0.9x | 2.52 | 3.17 |
+| surrounding_deep | 546.31 | 40.53 | 13.5x | 625.66 | 50.35 |
+| highlight | 0.80 | 2.65 | 0.3x | 3.29 | 3.39 |
+| motion_unmatched | 558.72 | 51.00 | 11.0x | 647.22 | 65.78 |
 
 ## nested_lua_2k.lua
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.93 | 0.47 | 2.0x | 9.91 | 0.59 |
-| matching_middle | 17.74 | 0.53 | 33.4x | 27.83 | 0.72 |
-| surrounding_deep | 848.22 | 2.67 | 317.8x | 1,169.04 | 4.44 |
-| highlight | 1.79 | 0.59 | 3.0x | 9.98 | 0.70 |
-| motion_unmatched | 316.71 | 3.53 | 89.8x | 663.53 | 3.71 |
+| matching_outer | 0.27 | 0.40 | 0.7x | 0.36 | 0.45 |
+| matching_middle | 2.26 | 0.53 | 4.3x | 2.41 | 0.67 |
+| surrounding_deep | 111.11 | 6.76 | 16.4x | 127.59 | 10.61 |
+| highlight | 0.88 | 0.76 | 1.1x | 4.05 | 1.34 |
+| motion_unmatched | 127.72 | 13.34 | 9.6x | 166.41 | 19.03 |
 
 ## nested_lua_50k.lua
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 0.76 | 0.35 | 2.2x | 1.41 | 0.38 |
-| matching_middle | 4.87 | 0.67 | 7.2x | 6.34 | 0.76 |
-| surrounding_deep | 8,044.23 | 1.77 | 4,532.3x | 9,770.19 | 1.87 |
-| highlight | 1.23 | 0.38 | 3.2x | 4.74 | 1.17 |
-| motion_unmatched | 756.63 | 2.46 | 308.1x | 760.11 | 2.91 |
+| matching_outer | 0.31 | 0.51 | 0.6x | 0.45 | 0.81 |
+| matching_middle | 2.81 | 0.93 | 3.0x | 3.06 | 1.24 |
+| surrounding_deep | 2,717.16 | 7.13 | 381.4x | 2,841.07 | 7.51 |
+| highlight | 0.71 | 0.46 | 1.6x | 3.36 | 1.30 |
+| motion_unmatched | 756.25 | 8.18 | 92.5x | 756.50 | 11.83 |
 
 ## nested_vim_10k.vim
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 15.58 | 2.69 | 5.8x | 18.75 | 3.44 |
-| matching_middle | 6.67 | 3.29 | 2.0x | 7.80 | 3.52 |
-| surrounding_deep | 1,336.83 | 203.21 | 6.6x | 1,530.43 | 235.46 |
-| highlight | 1.33 | 4.01 | 0.3x | 9.00 | 6.57 |
-| motion_unmatched | 754.83 | 216.66 | 3.5x | 756.29 | 282.00 |
+| matching_outer | 15.62 | 14.35 | 1.1x | 18.11 | 17.08 |
+| matching_middle | 5.80 | 3.74 | 1.6x | 7.87 | 4.24 |
+| surrounding_deep | 930.20 | 183.85 | 5.1x | 1,114.38 | 209.34 |
+| highlight | 1.13 | 4.54 | 0.2x | 8.95 | 9.15 |
+| motion_unmatched | 754.58 | 191.97 | 3.9x | 755.35 | 225.78 |
 
 ## nested_vim_2k.vim
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 13.48 | 1.18 | 11.4x | 14.91 | 1.74 |
-| matching_middle | 7.57 | 2.02 | 3.7x | 10.73 | 2.89 |
-| surrounding_deep | 346.35 | 79.65 | 4.3x | 400.45 | 92.31 |
-| highlight | 1.77 | 1.99 | 0.9x | 8.47 | 3.30 |
-| motion_unmatched | 405.57 | 83.82 | 4.8x | 468.97 | 99.05 |
+| matching_outer | 10.34 | 11.87 | 0.9x | 12.35 | 15.58 |
+| matching_middle | 3.93 | 1.37 | 2.9x | 4.59 | 1.69 |
+| surrounding_deep | 242.98 | 89.97 | 2.7x | 290.83 | 130.67 |
+| highlight | 1.18 | 1.15 | 1.0x | 5.84 | 2.36 |
+| motion_unmatched | 246.26 | 86.05 | 2.9x | 293.18 | 101.43 |
 
 ## nested_vim_50k.vim
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 12.89 | 1.08 | 12.0x | 13.79 | 1.66 |
-| matching_middle | 6.01 | 2.21 | 2.7x | 8.61 | 2.97 |
-| surrounding_deep | 14,747.52 | 16.24 | 908.1x | 17,016.15 | 17.87 |
-| highlight | 0.95 | 0.66 | 1.5x | 31.41 | 2.68 |
-| motion_unmatched | 756.42 | 15.85 | 47.7x | 765.96 | 16.66 |
+| matching_outer | 8.63 | 10.81 | 0.8x | 9.11 | 11.80 |
+| matching_middle | 4.05 | 1.85 | 2.2x | 4.62 | 2.47 |
+| surrounding_deep | 8,606.27 | 12.84 | 670.4x | 9,421.30 | 15.63 |
+| highlight | 0.74 | 0.65 | 1.1x | 24.15 | 2.22 |
+| motion_unmatched | 753.71 | 13.92 | 54.1x | 755.14 | 17.71 |
 
 ## real_vim_50k.vim
 
 | op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
 |---|---:|---:|---:|---:|---:|
-| matching_outer | 3.88 | 1.40 | 2.8x | 5.13 | 1.56 |
-| matching_middle | 4.25 | 1.96 | 2.2x | 5.01 | 2.28 |
-| surrounding_deep | 83,232.56 | 25,542.34 | 3.3x | 112,797.59 | 52,126.44 |
-| highlight | 1.39 | 3.08 | 0.5x | 38.85 | 30.80 |
-| motion_unmatched | 751.45 | 752.19 | 1.0x | 1,003.44 | 754.88 |
+| matching_outer | 3.29 | 1.44 | 2.3x | 3.73 | 1.45 |
+| matching_middle | 3.59 | 1.72 | 2.1x | 4.21 | 1.79 |
+| surrounding_deep | 93,990.87 | 21,349.53 | 4.4x | 99,801.50 | 21,798.43 |
+| highlight | 1.13 | 1.07 | 1.1x | 29.62 | 18.01 |
+| motion_unmatched | 751.33 | 751.32 | 1.0x | 751.41 | 752.01 |
 
 ## Summary (median speedup, geometric mean over files)
 
 | op | speedup |
 |---|---:|
-| matching_outer | 1.8x |
-| matching_middle | 2.1x |
-| surrounding_deep | 115.8x |
-| highlight | 1.0x |
-| motion_unmatched | 35.1x |
-| **overall** | **6.9x** |
-
-
----
-
-## Treesitter engine (pure-Rust port vs vim.treesitter)
-
-Both engines run with `g:matchup_treesitter_enabled = v:true`, offscreen rendering disabled, in a fresh headless process per engine and file (the original's uuid-LRU cache degrades its own results in long sessions). The Rust side loads grammar parsers from the runtimepath via `libloading` and parses with the `tree-sitter` crate - no `vim.treesitter` API calls. `cold first call` includes the initial full parse (Rust) vs nvim's incremental LanguageTree parse (original); warm ops dominate interactive use.
-
-### nested_c_10k.c
-
-cold first call: orig 113.7 ms, rust 133.7 ms
-
-| op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
-|---|---:|---:|---:|---:|---:|
-| ts_current | 10.61 | 6.37 | 1.7x | 14.68 | 8.37 |
-| ts_matching | 23.72 | 11.55 | 2.1x | 27.99 | 18.30 |
-| ts_highlight | 12.59 | 6.80 | 1.9x | 27.00 | 15.34 |
-
-### nested_lua_10k.lua
-
-cold first call: orig 75.0 ms, rust 81.0 ms
-
-| op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
-|---|---:|---:|---:|---:|---:|
-| ts_current | 6.12 | 6.49 | 0.9x | 9.98 | 8.06 |
-| ts_matching | 11.25 | 13.44 | 0.8x | 15.31 | 17.65 |
-| ts_highlight | 7.53 | 6.44 | 1.2x | 15.89 | 16.46 |
-
-### nested_vim_10k.vim
-
-cold first call: orig 51.9 ms, rust 59.1 ms
-
-| op | orig median (ms) | rust median (ms) | speedup | orig p95 (ms) | rust p95 (ms) |
-|---|---:|---:|---:|---:|---:|
-| ts_current | 4.38 | 3.45 | 1.3x | 6.93 | 5.39 |
-| ts_matching | 9.40 | 6.73 | 1.4x | 12.94 | 7.33 |
-| ts_highlight | 12.28 | 6.14 | 2.0x | 18.10 | 8.24 |
+| matching_outer | 0.6x |
+| matching_middle | 1.3x |
+| surrounding_deep | 24.6x |
+| highlight | 0.8x |
+| motion_unmatched | 10.9x |
+| **overall** | **2.8x** |
 

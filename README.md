@@ -145,17 +145,24 @@ identical buffers: `bench/run.sh` (classic engine) and `bench/ts_run.sh`
 mean over 2k/10k/50k-line synthetic vim/C/lua files plus a real 50k-line
 vimscript corpus.
 
-**Classic engine** - overall geomean **6.9x**:
+**Classic engine** - dramatically faster on the expensive operations, at parity
+on trivial ones. The overall geometric mean is methodology/machine-sensitive
+(the original's large-file cost grows with iteration count as its delim memo
+thrashes, so a low-iteration run measures a smaller ratio); across runs it lands
+~3-7x. The robust per-operation medians from a clean same-session run (overall
+geomean **2.8x**):
 
-- `get_surrounding` from deep inside a large file: **~116x** faster (geomean;
-  up to ~4,500x on 50k-line files, where the original's backward walk takes
-  5-83 *seconds* per call)
-- `[%`-style motion: **~35x** faster (the original pins its 750 ms timeout on
+- `get_surrounding` from deep inside a large file: **~25x** faster (geomean;
+  the original's backward walk takes 0.1-94 *seconds* per call on 50k-line
+  files, while the Rust engine stays in the low milliseconds except on the real
+  50k-line corpus, where both are seconds-scale)
+- `[%`-style motion: **~11x** faster (the original pins its 750 ms timeout on
   large files; the Rust engine finishes in ~1-20 ms)
-- full-file `get_matching`: geomean ~2x, ranging ~0.2-12x by filetype - vim's
-  regex-heavy `match_words` benefits most, while single-character C/lua
-  `&matchpairs` are already fast in vim's C search loop (down to ~0.2x)
-- highlight cycle: at parity (~1.0x; sub-millisecond to ~2 ms both sides)
+- full-file `get_matching`: geomean ~1x, ~0.6-2.3x by filetype - vim's
+  regex-heavy `match_words` benefits, while single-character C/lua `&matchpairs`
+  are already fast in vim's C search loop (trivial lookups land at parity or
+  slightly under)
+- highlight cycle: at parity (~0.8-1.1x; ~1-3 ms both sides)
 
 **Treesitter engine** - pure-Rust port vs nvim's native `vim.treesitter`:
 **~1.3-2.1x** faster on vim and C buffers (highlight up to 2.0x) and at parity

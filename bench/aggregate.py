@@ -90,9 +90,11 @@ def main():
                '(cursor alternates between two positions per iteration)')
     out.append('  - `motion_unmatched`: `[%`-style motion from the target '
                'line (cursor reset each iteration, outside the timed region)')
-    out.append('- 1 warm-up iteration, then 50 (2k files) / 30 (10k) / 15 '
-               '(50k and real file) timed iterations via `vim.uv.hrtime()`; '
-               'median and p95 reported')
+    out.append('- 1 warm-up iteration, then 50 (2k files) / 30 (10k) / 6 '
+               '(50k) / 3 (real 50k file) timed iterations via '
+               '`vim.uv.hrtime()`; median and p95 reported. The 50k counts are '
+               'low because the original engine\'s surrounding_deep costs '
+               '~1-89s per call there, so more iterations would not finish')
     out.append('- raw engine ops run with the timeout budget disabled on '
                'both sides (`matchup#perf#timeout_start(0)`); highlight and '
                'motion use their normal budgets')
