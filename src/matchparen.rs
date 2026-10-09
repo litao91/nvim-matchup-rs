@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use nvim_oxi::api::{self, opts::CreateAutocmdOpts, types::ExtmarkVirtTextPosition};
+use nvim_oxi::api::{self, types::ExtmarkVirtTextPosition};
 use nvim_oxi::{Array, Object};
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts};
@@ -88,52 +88,67 @@ pub fn setup(state: &SharedState) {
         Err(_) => return,
     };
 
-    // NOTE: command-based autocmds; LuaRef callbacks register but never
-    // fire on nvim 0.13-dev (nvim-oxi 0.6 ABI mismatch).
-    let ac = |events: &[&str], command: &str, pattern: Option<&str>| {
-        let mut b = CreateAutocmdOpts::builder();
-        b.group(group).patterns([pattern.unwrap_or("*")]).command(command);
-        if let Err(e) = api::create_autocmd(events.iter().copied(), &b.build()) {
-            trace(&format!("autocmd {events:?} failed: {e:?}"));
-        }
-    };
+    let gid = group as i32;
 
-    ac(
-        &[
-            "CursorMoved",
-            "CursorMovedI",
-            "TextChanged",
-            "TextChangedI",
-            "TextChangedP",
-        ],
-        "lua require('matchup_rs').highlight_deferred()",
-        None,
+    // Native LuaRef callbacks via our own FFI layer. nvim-oxi 0.6's
+    // create_autocmd keyset predates nvim 0.13's layout, so its `.callback`
+    // registers but never fires; nvimrs::create_autocmd_cb uses the correct
+    // KeyDict_create_autocmd, so real Rust callbacks work.
+    use crate::nvimrs::create_autocmd_cb;
+    use nvim_oxi::api::types::AutocmdCallbackArgs;
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(
+        &["CursorMoved", "CursorMovedI", "TextChanged", "TextChangedI", "TextChangedP"],
+        gid,
+        "*",
+        move |_a: AutocmdCallbackArgs| {
+            crate::guard("ac_highlight_deferred", || {
+                crate::with_ctx(&s, |ctx| highlight_deferred(ctx));
+            });
+            false
+        },
     );
-    ac(
-        &["WinEnter", "InsertLeave"],
-        "lua require('matchup_rs').update()",
-        None,
-    );
-    ac(
-        &["InsertEnter", "InsertChange"],
-        "lua require('matchup_rs').update_insert()",
-        None,
-    );
-    ac(
-        &["OptionSet"],
-        "lua require('matchup_rs').update()",
-        Some("signcolumn"),
-    );
-    ac(
-        &["WinLeave", "BufLeave"],
-        "lua require('matchup_rs').clear()",
-        None,
-    );
-    ac(
-        &["BufDelete", "BufWipeout"],
-        "lua require('matchup_rs').drop_buf(tonumber(vim.fn.expand('<abuf>')) or 0)",
-        None,
-    );
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(&["WinEnter", "InsertLeave"], gid, "*", move |_a| {
+        crate::guard("ac_update", || {
+            crate::with_ctx(&s, |ctx| highlight(ctx, true, false));
+        });
+        false
+    });
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(&["InsertEnter", "InsertChange"], gid, "*", move |_a| {
+        crate::guard("ac_update_insert", || {
+            crate::with_ctx(&s, |ctx| highlight(ctx, true, true));
+        });
+        false
+    });
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(&["OptionSet"], gid, "signcolumn", move |_a| {
+        crate::guard("ac_update_signcolumn", || {
+            crate::with_ctx(&s, |ctx| highlight(ctx, true, false));
+        });
+        false
+    });
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(&["WinLeave", "BufLeave"], gid, "*", move |_a| {
+        crate::guard("ac_clear", || {
+            crate::with_ctx(&s, |ctx| clear(ctx));
+        });
+        false
+    });
+
+    let s = Rc::clone(state);
+    create_autocmd_cb(&["BufDelete", "BufWipeout"], gid, "*", move |a: AutocmdCallbackArgs| {
+        crate::guard("ac_drop_buf", || {
+            s.drop_buf(a.buffer.handle());
+        });
+        false
+    });
 }
 
 // ---------------------------------------------------------------------------

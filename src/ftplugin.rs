@@ -15,7 +15,7 @@
 
 use std::rc::Rc;
 
-use nvim_oxi::api::{self, opts::CreateAutocmdOpts, Buffer};
+use nvim_oxi::api::{self, Buffer};
 use nvim_oxi::{Array, Object};
 
 use crate::state::{GOpts, State};
@@ -478,13 +478,20 @@ pub fn setup(state: &SharedState) {
         Ok(g) => g,
         Err(_) => return,
     };
-    let mut b = CreateAutocmdOpts::builder();
-    b.group(group)
-        .patterns(["*"])
-        .command("lua require('matchup_rs').apply_ftplugin()");
-    if let Err(e) = api::create_autocmd(["FileType"], &b.build()) {
-        crate::matchparen::trace(&format!("ftplugin autocmd failed: {e:?}"));
-    }
+    // Native FileType callback (see nvimrs: oxi 0.6's .callback never fires on
+    // nvim 0.13). Applies the ft's definition to the event's buffer.
+    let s = Rc::clone(state);
+    crate::nvimrs::create_autocmd_cb(
+        &["FileType"],
+        group as i32,
+        "*",
+        move |a: nvim_oxi::api::types::AutocmdCallbackArgs| {
+            crate::guard("ac_ftplugin", || {
+                apply(&s, &a.buffer);
+            });
+            false
+        },
+    );
     // Apply to the current buffer too (its FileType may have fired pre-setup).
     apply_current(state);
 }

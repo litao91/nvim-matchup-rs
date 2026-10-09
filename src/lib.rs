@@ -17,6 +17,7 @@ pub mod engine;
 pub mod ftplugin;
 pub mod matchparen;
 pub mod motion;
+pub mod nvimrs;
 pub mod skip;
 pub mod state;
 pub mod textobj;
@@ -52,7 +53,7 @@ fn install_panic_hook() {
 
 /// Run a Lua-callback body, converting panics into nil results + error
 /// messages instead of aborting nvim.
-fn guard<R: Default>(name: &str, f: impl FnOnce() -> R) -> R {
+pub(crate) fn guard<R: Default>(name: &str, f: impl FnOnce() -> R) -> R {
     // SAFETY: single-threaded use; on panic the unwind drops all RefCell
     // guards normally, so no borrow state is poisoned.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
