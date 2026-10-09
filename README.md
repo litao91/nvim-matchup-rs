@@ -109,6 +109,14 @@ is re-runnable, so calling it again reconfigures. There are **no `g:matchup_*` o
 entirely in the `setup` table. Option names mirror vim-matchup's `g:matchup_<group>_<name>`, nested and de-prefixed
 (e.g. `g:matchup_treesitter_disable_virtual_text` -> `treesitter.disable_virtual_text`).
 
+**Highlight timeout.** `matchparen.timeout` (milliseconds, default 300; `matchparen.insert_timeout`, default 60, applies
+in insert mode) is a cooperative budget for locating the match: the delimiter scans check it and abort once it is
+exceeded, so an expensive cursor position skips its highlight instead of stalling editing. The budget is reset at the
+start of every highlight cycle (each `CursorMoved`). A few filetypes ship a tighter built-in override - OCaml uses
+100 ms (`ft_matchparen_timeout`, from the native per-filetype definitions) - and the global value covers everything
+else. For further cost control, `max_lines` disables matchup entirely on oversized buffers, and `matchparen.deferred`
+(with `deferred_show_delay` / `deferred_hide_delay`) debounces highlighting until the cursor pauses.
+
 Per-filetype delimiter definitions (`match_words`, `match_skip`, `midmap`, ...) are built into the Rust module
 (`src/ftplugin.rs`, a port of vim-matchup's `after/ftplugin/*.vim`) and applied from a `FileType` autocmd, so no
 vimscript ftplugin files are shipped. **All plugin config and runtime state lives in Rust** (`State.ft_config` and the
