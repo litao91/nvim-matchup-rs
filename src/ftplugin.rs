@@ -42,11 +42,9 @@ fn set_i64(buf: &Buffer, name: &str, val: i64) {
     let _ = buf.clone().set_var(name, val);
 }
 
-/// Read a buffer option via getbufvar - avoids the deprecated option API and
-/// the nvim 0.13-dev call ABI issue (integer handle interpolation only).
+/// Read a buffer-scoped option natively (nvim_get_option_value).
 fn buf_opt(buf: &Buffer, name: &str) -> String {
-    api::eval::<String>(&format!("getbufvar({}, '&{}')", buf.handle(), name))
-        .unwrap_or_default()
+    crate::nvimrs::get_option_as::<String>(name, buf.handle(), 0).unwrap_or_default()
 }
 
 /// Set a buffer option via setbufvar; the value passes through a
@@ -91,16 +89,16 @@ fn append(buf: &Buffer, s: &str) {
 /// its sha256() begins with `prefix`. Uses Vim's sha256() so the digest guards
 /// (which track the runtime ftplugin's exact b:match_words) stay valid.
 fn check(buf: &Buffer, prefix: &str) -> bool {
-    if !buf_exists(buf, "match_words") {
-        return false;
-    }
-    // prefix is hex; operate on the current buffer (the FileType target).
-    api::eval::<i64>(&format!(
-        "sha256(b:match_words) =~# '^{}' ? 1 : 0",
-        prefix
-    ))
-    .unwrap_or(0)
-        != 0
+    let mw = match buf_str(buf, "match_words") {
+        Some(m) => m,
+        None => return false,
+    };
+    // Native sha256() via nvim_call_function; the digest guards track the
+    // runtime ftplugin's exact b:match_words.
+    let hash: String =
+        crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(mw)]))
+            .unwrap_or_default();
+    hash.starts_with(prefix)
 }
 
 /// Port of matchup#util#matchpref, reading the setup(opts) matchpref table.
@@ -404,13 +402,19 @@ fn tex_setup_match_words(buf: &Buffer) {
 }
 
 fn ft_tex(gopts: &GOpts, buf: &Buffer) {
-    // vimtex detection reads external plugin state (not a matchup option), so
-    // it stays a g:/exists() probe; the matchup-side override is a matchpref.
-    let vimtex_active = api::eval::<i64>(
-        "get(g:, 'vimtex_enabled', exists('*vimtex#init') || exists('g:vimtex_version') ? 1 : 0)",
-    )
-    .unwrap_or(0)
-        != 0;
+    // vimtex detection reads external plugin state (not a matchup option):
+    // g:vimtex_enabled override, else exists('*vimtex#init')/g:vimtex_version.
+    let vimtex_active = crate::nvimrs::get_var_as::<i64>("vimtex_enabled")
+        .map(|v| v != 0)
+        .unwrap_or_else(|| {
+            crate::nvimrs::call_fn_as::<i64>(
+                "exists",
+                &Array::from_iter([Object::from("*vimtex#init")]),
+            )
+            .unwrap_or(0)
+                != 0
+                || crate::nvimrs::get_var_as::<Object>("vimtex_version").is_some()
+        });
     let override_vimtex = matchpref(gopts, "tex", "override_vimtex", false);
 
     if vimtex_active {

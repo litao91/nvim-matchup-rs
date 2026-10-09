@@ -4,6 +4,7 @@
 use std::rc::Rc;
 
 use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
+use nvim_oxi::{Array, Dictionary, Object};
 
 use crate::engine::{self, Ctx, SurroundOpts};
 use crate::state::State;
@@ -32,19 +33,14 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
 }
 
 fn motion_force() -> String {
-    let mode: String = api::eval("mode(1)").unwrap_or_default();
+    let mode: String =
+        crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+            .unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
         String::new()
     }
-}
-
-fn obj_str(o: Option<&nvim_oxi::Object>) -> String {
-    use nvim_oxi::conversion::FromObject;
-    o.cloned()
-        .and_then(|o| String::from_object(o).ok())
-        .unwrap_or_default()
 }
 
 fn in_indent(ctx: &Ctx, p: Pos) -> bool {
@@ -75,7 +71,8 @@ fn pos_next_eol(ctx: &Ctx, p: Pos) -> Pos {
 /// Port of matchup#util#matchpref: matchpref[&ft][id], read from the
 /// setup(opts) configuration (no `g:matchup_matchpref` global).
 fn matchpref(ctx: &Ctx, id: &str, default: bool) -> bool {
-    let ft: String = api::eval("&filetype").unwrap_or_default();
+    let ft: String =
+        crate::nvimrs::get_option_as("filetype", ctx.buf.handle(), 0).unwrap_or_default();
     ctx.gopts
         .matchpref
         .get(&ft)
@@ -85,7 +82,12 @@ fn matchpref(ctx: &Ctx, id: &str, default: bool) -> bool {
 }
 
 fn ishtmllike() -> bool {
-    let ft: String = api::eval("&filetype").unwrap_or_default();
+    let ft: String = crate::nvimrs::get_option_as(
+        "filetype",
+        api::get_current_buf().handle(),
+        0,
+    )
+    .unwrap_or_default();
     let first = ft.split('.').next().unwrap_or("");
     matches!(
         first,
@@ -115,25 +117,24 @@ fn ishtmllike() -> bool {
 pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     let v_motion_force = motion_force();
 
-    let vars: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
-        "[v:count, v:count1, v:operator, v:register, &selection, visualmode(), getpos(\"'<\")[1:2], getpos(\"'>\")[1:2]]",
-    )
-    .map(|a| a.into_iter().collect())
-    .unwrap_or_default();
-    let gi = |i: usize| -> i64 {
-        vars.get(i)
-            .cloned()
-            .and_then(|o| i64::try_from(o).ok())
-            .unwrap_or(0)
+    use crate::nvimrs::{call_fn0_as, call_fn_as, get_option_as, get_vvar_as};
+    let count = get_vvar_as::<i64>("count").unwrap_or(0);
+    let count1 = get_vvar_as::<i64>("count1").unwrap_or(0).max(1);
+    let operator = get_vvar_as::<String>("operator").unwrap_or_default();
+    let save_reg = get_vvar_as::<String>("register").unwrap_or_default();
+    let selection_opt = get_option_as::<String>("selection", 0, 0).unwrap_or_default();
+    let visualmode = call_fn0_as::<String>("visualmode").unwrap_or_default();
+    // getpos("'<")[1:2] / getpos("'>")[1:2] -> (lnum, col) both 1-based
+    let mark_pos = |m: &str| -> Pos {
+        let arr: Array = call_fn_as("getpos", &Array::from_iter([Object::from(m)]))
+            .unwrap_or_else(Array::new);
+        let v: Vec<Object> = arr.into_iter().collect();
+        let lnum = v.get(1).cloned().and_then(|o| i64::try_from(o).ok()).unwrap_or(0);
+        let col = v.get(2).cloned().and_then(|o| i64::try_from(o).ok()).unwrap_or(0);
+        Pos::new(lnum as usize, col as usize)
     };
-    let count = gi(0);
-    let count1 = gi(1).max(1);
-    let operator = obj_str(vars.get(2));
-    let save_reg = obj_str(vars.get(3));
-    let selection_opt = obj_str(vars.get(4));
-    let visualmode = obj_str(vars.get(5));
-    let sel_start = Pos::new(gi(6) as usize, gi(7) as usize);
-    let sel_end = Pos::new(gi(8) as usize, gi(9) as usize);
+    let sel_start = mark_pos("'<");
+    let sel_end = mark_pos("'>");
 
     let mut win = ctx.win.clone();
 
@@ -161,7 +162,8 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
             if rest.is_empty() {
                 linewise_op = true;
             } else if let Some(expr) = rest.strip_prefix(',') {
-                linewise_op = api::eval::<i64>(expr).unwrap_or(0) != 0;
+                // arbitrary user-config vimscript expression -> native nvim_eval
+                linewise_op = crate::nvimrs::eval_as::<i64>(expr).unwrap_or(0) != 0;
             }
         }
     } else if operator == ":"
@@ -222,7 +224,10 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
                     let keys = nvim_oxi::String::from("\u{1c}\u{1e}\u{1b}");
                     let mode = nvim_oxi::String::from("n");
                     api::feedkeys(&keys, &mode, false);
-                    let seq: i64 = api::eval("undotree().seq_cur").unwrap_or(0);
+                    let seq: i64 = crate::nvimrs::call_fn0_as::<Dictionary>("undotree")
+                        .and_then(|d| d.get("seq_cur").cloned())
+                        .and_then(|o| i64::try_from(o).ok())
+                        .unwrap_or(0);
                     let keys = nvim_oxi::String::from(format!(
                         ":call matchup#rs#text_obj_undo({seq})\r:\u{3}",
                         seq = seq
@@ -265,11 +270,12 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
                 set_cursor(&mut win, ctx, close.pos());
                 let _ = api::command("silent! execute \"normal! i \\<esc>v\"");
             } else if !"<>".contains(&operator) {
-                let byte: i64 = api::eval(&format!(
-                    "line2byte({}) + {} - 1",
-                    close.lnum, close.cnum
-                ))
+                let lb: i64 = crate::nvimrs::call_fn_as(
+                    "line2byte",
+                    &Array::from_iter([Object::from(close.lnum as i64)]),
+                )
                 .unwrap_or(0);
+                let byte: i64 = lb + close.cnum as i64 - 1;
                 let keys = nvim_oxi::String::from(format!("{byte}go"));
                 let mode = nvim_oxi::String::from("n");
                 api::feedkeys(&keys, &mode, false);
@@ -402,8 +408,12 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
                     set_cursor(&mut win, ctx, Pos::new(l1, c1));
                     let _ = api::command("silent! execute \"normal! i \\<esc>v\"");
                 } else if !"<>".contains(&operator) {
-                    let byte: i64 =
-                        api::eval(&format!("line2byte({l1}) + {c1} - 1")).unwrap_or(0);
+                    let lb: i64 = crate::nvimrs::call_fn_as(
+                        "line2byte",
+                        &Array::from_iter([Object::from(l1 as i64)]),
+                    )
+                    .unwrap_or(0);
+                    let byte: i64 = lb + c1 as i64 - 1;
                     let keys = nvim_oxi::String::from(format!("{byte}go"));
                     let mode = nvim_oxi::String::from("n");
                     api::feedkeys(&keys, &mode, false);
@@ -536,17 +546,15 @@ pub fn setup(state: &SharedState) {
                 format!("<cmd>lua require('matchup_rs').textobj({inner},{visual})<cr>")
             };
             let _ = api::set_keymap(mode, &plug, &rhs, &opts);
-            let unmapped: String = api::eval(&format!(
-                "maparg({}, {})",
-                crate::motion::vim_quote(lhs),
-                crate::motion::vim_quote(mode_s)
-            ))
+            let unmapped: String = crate::nvimrs::call_fn_as(
+                "maparg",
+                &Array::from_iter([Object::from(lhs), Object::from(mode_s)]),
+            )
             .unwrap_or_default();
-            let has: i64 = api::eval(&format!(
-                "hasmapto({}, {})",
-                crate::motion::vim_quote(&plug),
-                crate::motion::vim_quote(mode_s)
-            ))
+            let has: i64 = crate::nvimrs::call_fn_as(
+                "hasmapto",
+                &Array::from_iter([Object::from(plug.as_str()), Object::from(mode_s)]),
+            )
             .unwrap_or(0);
             if unmapped.is_empty() && has == 0 {
                 let _ = api::set_keymap(mode, lhs, &rhs, &opts);

@@ -3,7 +3,7 @@
 //! (delim.vim:868-935).
 
 use fancy_regex::Regex;
-use nvim_oxi::api;
+use nvim_oxi::{Array, Object};
 use once_cell::sync::Lazy;
 
 use crate::vimregex::{translate, Opts};
@@ -128,13 +128,20 @@ fn rewrite_eff(expr: &str) -> String {
 /// Syntax group name at position. `translate_id` corresponds to vim's
 /// synID(lnum, cnum, 1) vs synID(lnum, cnum, 0).
 pub fn syn_name(lnum: usize, cnum: usize, translate_id: bool) -> String {
-    let expr = format!(
-        "vim.fn.synIDattr(vim.fn.synID({},{},{}),'name')",
-        lnum,
-        cnum,
-        if translate_id { 1 } else { 0 }
-    );
-    api::eval::<String>(&expr).unwrap_or_default()
+    let id: i64 = crate::nvimrs::call_fn_as(
+        "synID",
+        &Array::from_iter([
+            Object::from(lnum as i64),
+            Object::from(cnum as i64),
+            Object::from(if translate_id { 1i64 } else { 0i64 }),
+        ]),
+    )
+    .unwrap_or(0);
+    crate::nvimrs::call_fn_as(
+        "synIDattr",
+        &Array::from_iter([Object::from(id), Object::from("name")]),
+    )
+    .unwrap_or_default()
 }
 
 /// Evaluate the skip expression at (lnum, cnum); `line` is the text of
@@ -170,13 +177,18 @@ pub fn skip_at(
             re.is_match(&line[..end]).unwrap_or(false) != *invert
         }
         SkipKind::Raw { expr } => {
-            // nvim_call_function is ABI-broken on nvim 0.13-dev; inline the
-            // expression as a single-quoted vimscript literal (fully literal,
-            // quotes doubled) in one eval round-trip.
-            let q = crate::motion::vim_quote(expr);
-            let r: i64 =
-                api::eval(&format!("matchup#rs#skip_eval({q}, {lnum}, {cnum})"))
-                    .unwrap_or(0);
+            // The shim evaluates the raw b:match_skip expression at an
+            // effective position (arbitrary vimscript, as upstream does with
+            // `execute 'return'`); invoke it natively via nvim_call_function.
+            let r: i64 = crate::nvimrs::call_fn_as(
+                "matchup#rs#skip_eval",
+                &Array::from_iter([
+                    Object::from(expr.as_str()),
+                    Object::from(lnum as i64),
+                    Object::from(cnum as i64),
+                ]),
+            )
+            .unwrap_or(0);
             r != 0
         }
     }
@@ -291,10 +303,22 @@ pub fn in_synstack(pat: &str, lnum: usize, cnum: usize, word: &str) -> bool {
             None
         }
     });
-    let names: Vec<String> = api::eval::<Vec<String>>(&format!(
-        "vim.tbl_map(function(i) return vim.fn.synIDattr(i,'name') end, vim.fn.synstack({lnum},{cnum}))"
-    ))
-    .unwrap_or_default();
+    let stack: Array = crate::nvimrs::call_fn_as(
+        "synstack",
+        &Array::from_iter([Object::from(lnum as i64), Object::from(cnum as i64)]),
+    )
+    .unwrap_or_else(Array::new);
+    let mut names: Vec<String> = Vec::new();
+    for o in stack {
+        if let Ok(id) = i64::try_from(o) {
+            if let Some(n) = crate::nvimrs::call_fn_as::<String>(
+                "synIDattr",
+                &Array::from_iter([Object::from(id), Object::from("name")]),
+            ) {
+                names.push(n);
+            }
+        }
+    }
     let found = match &re {
         Some(re) => names.iter().any(|n| re.is_match(n).unwrap_or(false)),
         None => false,

@@ -110,6 +110,7 @@ struct KeyDictOption {
 }
 const OPTIDX_OPTION_BUF: u64 = 1;
 const OPTIDX_OPTION_WIN: u64 = 3;
+const OPTIDX_OPTION_SCOPE: u64 = 4;
 
 /// `KeyDict_echo_opts` (keysets_defs.h:370-382); passed zeroed (all defaults).
 #[repr(C)]
@@ -154,6 +155,15 @@ unsafe extern "C" {
         opts: *const KeyDictOption,
         err: *mut CError,
     ) -> Object;
+    fn nvim_get_var(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
+    fn nvim_get_vvar(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
+    fn nvim_buf_get_var(buf: i32, name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
+    fn nvim_get_runtime_file(
+        name: CStr,
+        all: bool,
+        arena: *mut c_void,
+        err: *mut CError,
+    ) -> Array;
 }
 
 // --- safe wrappers ---------------------------------------------------------
@@ -219,8 +229,18 @@ pub fn echo(text: &str) {
 
 /// Native option read. `buf`/`win` = 0 means global scope.
 pub fn get_option_value(name: &str, buf: i32, win: i32) -> Option<Object> {
+    get_option_scoped(name, "", buf, win)
+}
+
+/// Native option read with an explicit `scope` ("", "local", "global").
+fn get_option_scoped(name: &str, scope: &str, buf: i32, win: i32) -> Option<Object> {
     let (_guard, cname) = cstr(name)?;
+    let (_sguard, cscope) = cstr(scope)?;
     let mut opts: KeyDictOption = unsafe { std::mem::zeroed() };
+    if !scope.is_empty() {
+        opts.scope = cscope;
+        opts.is_set |= 1 << OPTIDX_OPTION_SCOPE;
+    }
     if buf != 0 {
         opts.buf = buf;
         opts.is_set |= 1 << OPTIDX_OPTION_BUF;
@@ -240,6 +260,60 @@ pub fn get_option_value(name: &str, buf: i32, win: i32) -> Option<Object> {
 pub fn get_option_as<V: FromObject>(name: &str, buf: i32, win: i32) -> Option<V> {
     let obj = get_option_value(name, buf, win)?;
     V::from_object(obj).ok()
+}
+
+/// Window-local option read (`&l:{name}` in vimscript).
+pub fn get_option_local_as<V: FromObject>(name: &str, win: i32) -> Option<V> {
+    let obj = get_option_scoped(name, "local", 0, win)?;
+    V::from_object(obj).ok()
+}
+
+/// Native `nvim_get_var` (g: scope).
+pub fn get_var_as<V: FromObject>(name: &str) -> Option<V> {
+    let (_g, cname) = cstr(name)?;
+    let mut err = CError::new();
+    let obj = unsafe { nvim_get_var(cname, ptr::null_mut(), &mut err) };
+    if err.is_err() {
+        None
+    } else {
+        V::from_object(obj).ok()
+    }
+}
+
+/// Native `nvim_get_vvar` (v: scope, e.g. count/operator/register/insertmode).
+pub fn get_vvar_as<V: FromObject>(name: &str) -> Option<V> {
+    let (_g, cname) = cstr(name)?;
+    let mut err = CError::new();
+    let obj = unsafe { nvim_get_vvar(cname, ptr::null_mut(), &mut err) };
+    if err.is_err() {
+        None
+    } else {
+        V::from_object(obj).ok()
+    }
+}
+
+/// Native `nvim_buf_get_var` (b: scope) by buffer handle.
+pub fn buf_get_var_as<V: FromObject>(buf: i32, name: &str) -> Option<V> {
+    let (_g, cname) = cstr(name)?;
+    let mut err = CError::new();
+    let obj = unsafe { nvim_buf_get_var(buf, cname, ptr::null_mut(), &mut err) };
+    if err.is_err() {
+        None
+    } else {
+        V::from_object(obj).ok()
+    }
+}
+
+/// Native `nvim_get_runtime_file`.
+pub fn get_runtime_file(name: &str, all: bool) -> Option<Array> {
+    let (_g, cname) = cstr(name)?;
+    let mut err = CError::new();
+    let arr = unsafe { nvim_get_runtime_file(cname, all, ptr::null_mut(), &mut err) };
+    if err.is_err() {
+        None
+    } else {
+        Some(arr)
+    }
 }
 
 /// Register an autocmd whose handler is a native Rust callback (a real LuaRef

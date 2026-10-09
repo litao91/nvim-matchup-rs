@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use fancy_regex::Regex;
-use nvim_oxi::api::{self, Buffer, Window as NvimWindow};
+use nvim_oxi::api::{Buffer, Window as NvimWindow};
+use nvim_oxi::{Array, Object};
 
 use crate::skip::{in_synstack, skip_at, MidSkip};
 use crate::state::{BufCompiled, GOpts, SharedRegex, State, Union};
@@ -123,9 +124,15 @@ impl<'a> Ctx<'a> {
         let cursor = win.get_cursor().map(|(r, _)| r).unwrap_or(1);
         let margin = gopts.delim_stopline.max(gopts.matchparen_stopline) + 100;
         let lines = Lines::fetch_for_cursor(&buf, cursor, margin);
-        let mode: String = api::eval("mode(1)").unwrap_or_else(|_| "n".to_string());
-        let synmaxcol: i64 = api::eval("&synmaxcol").unwrap_or(0);
-        let syntax_on: i64 = api::eval("exists('g:syntax_on')").unwrap_or(0);
+        let mode: String = crate::nvimrs::call_fn_as(
+            "mode",
+            &Array::from_iter([Object::from(1i64)]),
+        )
+        .unwrap_or_else(|| "n".to_string());
+        let synmaxcol: i64 =
+            crate::nvimrs::get_option_as("synmaxcol", buf.handle(), 0).unwrap_or(0);
+        let syntax_on: i64 =
+            if crate::nvimrs::get_var_as::<Object>("syntax_on").is_some() { 1 } else { 0 };
         let ts_lang = if gopts.ts_enabled {
             crate::treesitter::active_lang(state, gopts, buf.handle())
         } else {
@@ -302,7 +309,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
         return None;
     }
     // async events pending (delim.vim:363)
-    if api::eval::<String>("state('a')")
+    if crate::nvimrs::call_fn_as::<String>("state", &Array::from_iter([Object::from("a")]))
         .map(|s| !s.is_empty())
         .unwrap_or(false)
     {

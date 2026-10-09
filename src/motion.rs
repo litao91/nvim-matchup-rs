@@ -4,6 +4,7 @@
 use std::rc::Rc;
 
 use nvim_oxi::api::{self, opts::SetKeymapOpts, types::Mode};
+use nvim_oxi::{Array, Object};
 
 use crate::engine::{self, Ctx, Direction, GetDelimOpts, MatchOpts, SurroundOpts};
 use crate::state::State;
@@ -45,13 +46,11 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
     ));
 }
 
-fn eval_str(expr: &str) -> String {
-    api::eval(expr).unwrap_or_default()
-}
-
 /// Port of matchup#motion_force (matchup.vim:167).
 fn motion_force() -> String {
-    let mode = eval_str("mode(1)");
+    let mode: String =
+        crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+            .unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
@@ -73,50 +72,41 @@ struct Vars {
 }
 
 fn read_vars(ctx: &Ctx) -> Vars {
-    let vals: Vec<nvim_oxi::Object> = api::eval::<nvim_oxi::Array>(
-        "[v:count, v:count1, v:operator, v:register, &selection, visualmode(), &foldopen, &startofline]",
-    )
-    .map(|a| a.into_iter().collect())
-    .unwrap_or_default();
-    let gi = |i: usize| -> i64 {
-        vals.get(i)
-            .cloned()
-            .and_then(|o| i64::try_from(o).ok())
-            .unwrap_or(0)
-    };
-    let gs = |i: usize| -> String {
-        use nvim_oxi::conversion::FromObject;
-        vals.get(i)
-            .cloned()
-            .and_then(|o| String::from_object(o).ok())
-            .unwrap_or_default()
-    };
+    use crate::nvimrs::{call_fn0_as, get_option_as, get_vvar_as};
+    let count = get_vvar_as::<i64>("count").unwrap_or(0);
+    let count1 = get_vvar_as::<i64>("count1").unwrap_or(0).max(1);
+    let operator_v = get_vvar_as::<String>("operator").unwrap_or_default();
+    let register = get_vvar_as::<String>("register").unwrap_or_default();
+    let selection = get_option_as::<String>("selection", 0, 0).unwrap_or_default();
+    let visualmode = call_fn0_as::<String>("visualmode").unwrap_or_default();
+    let foldopen = get_option_as::<String>("foldopen", 0, 0).unwrap_or_default();
+    let startofline = get_option_as::<bool>("startofline", 0, 0).unwrap_or(false);
     // during the op() re-feed, v:operator may be cleared; use the stash
     let stashed = ctx.state.op_operator.borrow().clone();
-    let operator = if stashed.is_empty() { gs(2) } else { stashed };
+    let operator = if stashed.is_empty() { operator_v } else { stashed };
     Vars {
-        count: gi(0),
-        count1: gi(1).max(1),
+        count,
+        count1,
         operator,
-        register: gs(3),
-        selection: gs(4),
-        visualmode: gs(5),
-        foldopen: gs(6),
-        startofline: gi(7) != 0,
+        register,
+        selection,
+        visualmode,
+        foldopen,
+        startofline,
     }
 }
 
 /// Ensure visual mode is active for a visual mapping callback (the
 /// original re-enters with `normal! gv` after `:<c-u>`).
 fn ensure_visual() {
-    let m = eval_str("mode()");
+    let m: String = crate::nvimrs::call_fn0_as("mode").unwrap_or_default();
     if !m.starts_with('v') && !m.starts_with('V') && !m.contains('\x16') && !m.starts_with("^V") {
         normal("gv");
     }
 }
 
 fn in_indentexpr() -> bool {
-    api::eval::<i64>("matchup#rs#in_indentexpr()").unwrap_or(0) != 0
+    crate::nvimrs::call_fn0_as::<i64>("matchup#rs#in_indentexpr").unwrap_or(0) != 0
 }
 
 /// Port of matchup#pos#next_eol (pos.vim:49).
@@ -202,7 +192,11 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
 
     if in_indentexpr() {
         ctx.state.perf.timeout_start(300.0);
-        let col: i64 = api::eval("col('.') >= col('$') ? 1 : 0").unwrap_or(0);
+        let cur: i64 = crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from(".")]))
+            .unwrap_or(0);
+        let end: i64 = crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from("$")]))
+            .unwrap_or(0);
+        let col: i64 = if cur >= end { 1 } else { 0 };
         if !vars.startofline && col != 0 {
             normal("^");
         }
@@ -705,17 +699,15 @@ fn lhs_free(lhs: &str, mode: &str) -> bool {
     // mirror s:map: only map when lhs is unmapped and nothing is mapped
     // to the <Plug> sequence
     let plug = format!("<Plug>(matchup-{lhs})");
-    let unmapped: String = api::eval(&format!(
-        "maparg({}, {})",
-        vim_quote(lhs),
-        vim_quote(mode)
-    ))
+    let unmapped: String = crate::nvimrs::call_fn_as(
+        "maparg",
+        &Array::from_iter([Object::from(lhs), Object::from(mode)]),
+    )
     .unwrap_or_default();
-    let has: i64 = api::eval(&format!(
-        "hasmapto({}, {})",
-        vim_quote(&plug),
-        vim_quote(mode)
-    ))
+    let has: i64 = crate::nvimrs::call_fn_as(
+        "hasmapto",
+        &Array::from_iter([Object::from(plug.as_str()), Object::from(mode)]),
+    )
     .unwrap_or(0);
     unmapped.is_empty() && has == 0
 }
@@ -749,11 +741,11 @@ pub fn op_motion(ctx: &Ctx, plug: &str) {
     }
 
     let force = motion_force();
-    let operator = eval_str("v:operator");
+    let operator: String = crate::nvimrs::get_vvar_as("operator").unwrap_or_default();
     *ctx.state.op_operator.borrow_mut() = operator;
 
     let wise = if force.is_empty() { "v" } else { force.as_str() };
-    let count: i64 = api::eval("v:count").unwrap_or(0);
+    let count: i64 = crate::nvimrs::get_vvar_as("count").unwrap_or(0);
     let _ = api::set_var(
         "mrs_op_args",
         nvim_oxi::Array::from_iter([
@@ -763,7 +755,7 @@ pub fn op_motion(ctx: &Ctx, plug: &str) {
         ]),
     );
     ctx.state.in_op.set(true);
-    let _ = api::eval::<i64>("matchup#rs#op_exec()");
+    let _ = crate::nvimrs::call_fn0_as::<i64>("matchup#rs#op_exec");
     ctx.state.in_op.set(false);
     *ctx.state.op_operator.borrow_mut() = String::new();
 }

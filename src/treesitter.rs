@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 use libloading::Library;
 use nvim_oxi::api::{self, Buffer};
+use nvim_oxi::conversion::FromObject;
 use tree_sitter::{
     InputEdit, Language, Node, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
@@ -120,7 +121,7 @@ impl TsState {
 // ---------------------------------------------------------------------------
 
 fn rtp_dirs() -> Vec<PathBuf> {
-    let rtp: String = api::eval("&rtp").unwrap_or_default();
+    let rtp: String = crate::nvimrs::get_option_as("runtimepath", 0, 0).unwrap_or_default();
     rtp.split(',')
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -193,12 +194,11 @@ fn runtime_query_files(lang: &str) -> Vec<PathBuf> {
         format!("queries/{lang}/matchup.scm"),
         format!("after/queries/{lang}/matchup.scm"),
     ] {
-        let q = crate::motion::vim_quote(&pat);
-        if let Ok(arr) = api::eval::<Vec<String>>(&format!(
-            "nvim_get_runtime_file({q}, v:true)"
-        )) {
-            for s in arr {
-                out.push(PathBuf::from(s));
+        if let Some(arr) = crate::nvimrs::get_runtime_file(&pat, true) {
+            for o in arr {
+                if let Ok(s) = String::from_object(o) {
+                    out.push(PathBuf::from(s));
+                }
             }
         }
     }
@@ -377,7 +377,7 @@ fn ensure_tree(
     };
     let _ = lang;
     // language for this buffer
-    let ft: String = api::eval(&format!("getbufvar({bufnr}, '&filetype', '')")).unwrap_or_default();
+    let ft: String = crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     let language = language(state, &ft)?;
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
@@ -791,7 +791,7 @@ pub fn active_lang(state: &State, gopts: &GOpts, bufnr: i32) -> Option<String> {
         return None;
     }
     let ft: String =
-        api::eval(&format!("getbufvar({bufnr}, '&filetype', '')")).unwrap_or_default();
+        crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     if ft.is_empty() {
         return None;
     }
@@ -805,10 +805,13 @@ pub fn active_lang(state: &State, gopts: &GOpts, bufnr: i32) -> Option<String> {
     }
     let lang = ft.clone();
     let verdict = (|| -> Option<String> {
-        let buf_ok: i64 = api::eval(&format!(
-            "+getbufvar({bufnr}, 'matchup_treesitter_enabled', 1)"
-        ))
-        .unwrap_or(1);
+        let buf_ok: i64 =
+            crate::nvimrs::buf_get_var_as::<i64>(bufnr, "matchup_treesitter_enabled")
+                .or_else(|| {
+                    crate::nvimrs::buf_get_var_as::<bool>(bufnr, "matchup_treesitter_enabled")
+                        .map(|b| b as i64)
+                })
+                .unwrap_or(1);
         if buf_ok == 0 {
             return None;
         }

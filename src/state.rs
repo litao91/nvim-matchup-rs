@@ -9,9 +9,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use fancy_regex::Regex;
-use nvim_oxi::api::{self, Buffer};
+use nvim_oxi::api::Buffer;
 use nvim_oxi::conversion::FromObject;
-use nvim_oxi::{Dictionary, Object};
+use nvim_oxi::{Array, Dictionary, Object};
 
 use crate::skip::{compile_skip, SkipKind};
 use crate::types::Delim;
@@ -242,7 +242,12 @@ fn obj_strlist(o: &Object) -> Option<Vec<String>> {
 /// True when nvim is new enough for the treesitter default (upstream gates on
 /// 0.11.2). Evaluated once per setup() call.
 fn ts_default_enabled() -> bool {
-    api::eval::<i64>("has('nvim-0.11.2')").unwrap_or(0) != 0
+    crate::nvimrs::call_fn_as::<i64>(
+        "has",
+        &Array::from_iter([Object::from("nvim-0.11.2")]),
+    )
+    .unwrap_or(0)
+        != 0
 }
 
 impl GOpts {
@@ -704,11 +709,7 @@ fn buf_var_string(buf: &Buffer, name: &str) -> String {
 }
 
 fn buf_option(buf: &Buffer, name: &str) -> String {
-    // NOTE: nvim_call_function's C signature changed in nvim 0.13-dev
-    // (leading channel_id), which nvim-oxi 0.6 does not know about;
-    // use eval (verified working) with integer interpolation only.
-    api::eval::<String>(&format!("getbufvar({}, '&{}')", buf.handle(), name))
-        .unwrap_or_default()
+    crate::nvimrs::get_option_as::<String>(name, buf.handle(), 0).unwrap_or_default()
 }
 
 /// Build the word character class from &iskeyword.
@@ -892,7 +893,7 @@ pub fn ensure_buf(state: &State, buf: &Buffer, ts_words: TsWords) -> i32 {
         if let Some(cached) = state.expr_cache.borrow().get(&match_words_raw) {
             cached.clone()
         } else {
-            let v: String = api::eval(&match_words_raw).unwrap_or_default();
+            let v: String = crate::nvimrs::eval_as(&match_words_raw).unwrap_or_default();
             state
                 .expr_cache
                 .borrow_mut()

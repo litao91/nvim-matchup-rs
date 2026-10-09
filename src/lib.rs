@@ -343,10 +343,8 @@ fn matchup_rs() -> Result<Dictionary> {
                 e.maximum * 1000.0
             ));
         }
-        // api::echo is ABI-broken on nvim 0.13-dev; route through a
-        // global variable and :echo.
-        let _ = api::set_var("matchup_rs_times", out);
-        let _ = api::command("echo g:matchup_rs_times");
+        // native nvim_echo (oxi's api::echo is ABI-broken on 0.13-dev).
+        nvimrs::echo(&out);
         Ok(())
     });
 
@@ -421,7 +419,11 @@ fn matchup_rs() -> Result<Dictionary> {
             with_ctx(state, |ctx| {
                 let moved = f(ctx);
                 if !moved {
-                    let m: String = api::eval("mode(1)").unwrap_or_default();
+                    let m: String = nvimrs::call_fn_as(
+                        "mode",
+                        &Array::from_iter([Object::from(1i64)]),
+                    )
+                    .unwrap_or_default();
                     if m.starts_with("no") {
                         let k = nvim_oxi::String::from("\x1b");
                         let md = nvim_oxi::String::from("n");
