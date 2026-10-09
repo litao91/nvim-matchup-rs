@@ -62,14 +62,17 @@ or headlessly:
 nvim --headless "+lua require('matchup_rs.build').build()" +qa
 ```
 
-`build()` runs `cargo build --release` (via `--manifest-path`/`--target-dir`, so
-your working directory is untouched), picks the right artifact per platform
-(`libmatchup_rs.so` on Linux, `libmatchup_rs.dylib` on macOS, `matchup_rs.dll`
-on Windows), and atomically copies it to `lua/matchup_rs.so` (`.dll` on Windows)
-where `require('matchup_rs')` finds it. Options:
-`build({ profile = 'debug' })`, `build({ dir = '<repo root>' })`, and
-`build({ touch = true })` (touch `src/*.rs` first - a stale-mtime workaround on
-WSL2/drvfs). It needs a Rust toolchain on `PATH`. Equivalent manual steps:
+`build()` runs `cargo build --release` asynchronously (via `vim.system`, so it
+does not block nvim; `--manifest-path`/`--target-dir` leave your working
+directory untouched), notifies on completion, and captures compiler output to a
+log you can open with `require('matchup_rs.build').build_log()`. On success it
+picks the right artifact per platform (`libmatchup_rs.so` on Linux,
+`libmatchup_rs.dylib` on macOS, `matchup_rs.dll` on Windows) and atomically
+copies it to `lua/matchup_rs.so` (`.dll` on Windows) where `require('matchup_rs')`
+finds it. Because it is async, a running nvim loads the new module on the *next*
+start. Options: `build({ profile = 'debug' })`, `build({ dir = '<repo root>' })`,
+and `build({ touch = true })` (touch `src/*.rs` first - a stale-mtime workaround
+on WSL2/drvfs). It needs a Rust toolchain on `PATH`. Equivalent manual steps:
 
 ```sh
 cargo build --release

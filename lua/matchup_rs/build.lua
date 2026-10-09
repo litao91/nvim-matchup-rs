@@ -3,11 +3,18 @@
 --   :lua require('matchup_rs.build').build()
 --   :lua require('matchup_rs.build').build({ profile = 'debug' })
 --   :lua require('matchup_rs.build').build({ touch = true })  -- WSL2/drvfs mtime
+--   :lua require('matchup_rs.build').build_log()              -- open the build log
 --
--- Pure Lua: this does NOT depend on the compiled .so, so it can build it from
--- scratch. cargo names the cdylib lib<name>.so / lib<name>.dylib on unix and
--- <name>.dll on windows; nvim's package.cpath loads it as lua/matchup_rs.so
--- (unix) or lua/matchup_rs.dll (windows).
+-- Follows the blink.cmp fuzzy-build convention: an async `vim.system` cargo
+-- run (non-blocking), progress notifications, and the compiler output captured
+-- to a log file you can open with build_log(). Pure Lua - this does NOT depend
+-- on the compiled .so, so it can build it from scratch. cargo names the cdylib
+-- lib<name>.so / lib<name>.dylib on unix and <name>.dll on windows; nvim's
+-- package.cpath loads it as lua/matchup_rs.so (unix) or lua/matchup_rs.dll.
+--
+-- The build is asynchronous: build() returns immediately and notifies on
+-- completion. A running nvim that already require'd the native module keeps the
+-- old code until restarted.
 --
 -- opts:
 --   dir      repo root (default: derived from this file's path, else :pwd)
@@ -21,7 +28,6 @@ local function uv()
 end
 
 local function sep()
-  -- directory separator for the running platform
   return (package.config:sub(1, 1) == '\\') and '\\' or '/'
 end
 
@@ -53,6 +59,14 @@ local function repo_root(opts)
   return vim.fn.getcwd()
 end
 
+local function log_path()
+  return vim.fn.stdpath('cache') .. sep() .. 'matchup_rs_build.log'
+end
+
+local function notify(level, msg)
+  vim.notify(msg, level, { title = 'matchup_rs' })
+end
+
 -- Copy src over dest atomically: write to dest.tmp then rename, so a .so that
 -- is currently mmap'd by this nvim is not clobbered in place (avoids ETXTBSY).
 local function copy_over(u, src, dest)
@@ -72,6 +86,35 @@ local function copy_over(u, src, dest)
   return true
 end
 
+-- Deploy the built cdylib to lua/matchup_rs.{so,dll} (platform-specific).
+local function deploy(u, root, release)
+  local s = sep()
+  local prof_dir = release and 'release' or 'debug'
+  local target = root .. s .. 'target' .. s .. prof_dir
+  local artifact, dest
+  if is_windows() then
+    artifact = target .. s .. 'matchup_rs.dll'
+    dest = root .. s .. 'lua' .. s .. 'matchup_rs.dll'
+  elseif is_mac() then
+    artifact = target .. s .. 'libmatchup_rs.dylib'
+    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
+  else
+    artifact = target .. s .. 'libmatchup_rs.so'
+    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
+  end
+  local luadir = root .. s .. 'lua'
+  if not u.fs_stat(luadir) then
+    u.fs_mkdir(luadir, 493) -- 0755
+  end
+  local ok, err = copy_over(u, artifact, dest)
+  if not ok then
+    return nil, err
+  end
+  return dest
+end
+
+--- Build the native module from source (asynchronous).
+--- @param opts? { dir?: string, profile?: 'release'|'debug', touch?: boolean }
 function M.build(opts)
   opts = opts or {}
   local u = uv()
@@ -95,42 +138,57 @@ function M.build(opts)
   args[#args + 1] = '--target-dir'
   args[#args + 1] = root .. s .. 'target'
 
-  print('build: ' .. table.concat(args, ' '))
-  local out = vim.fn.system(args)
-  if vim.v.shell_error ~= 0 then
-    io.stderr:write('build: cargo failed:\n' .. (out or '') .. '\n')
-    return false
+  local log = io.open(log_path(), 'w')
+  if log then
+    log:write('Working Directory: ' .. root .. '\n')
+    log:write('Command: ' .. table.concat(args, ' ') .. '\n\n---\n\n')
+    log:flush()
   end
 
-  local prof_dir = release and 'release' or 'debug'
-  local target = root .. s .. 'target' .. s .. prof_dir
-  local artifact, dest
-  if is_windows() then
-    artifact = target .. s .. 'matchup_rs.dll'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.dll'
-  elseif is_mac() then
-    artifact = target .. s .. 'libmatchup_rs.dylib'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
-  else
-    artifact = target .. s .. 'libmatchup_rs.so'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
-  end
+  notify(vim.log.levels.INFO, 'Building native module from source...')
 
-  local luadir = root .. s .. 'lua'
-  if not u.fs_stat(luadir) then
-    u.fs_mkdir(luadir, 493) -- 0755
-  end
+  vim.system(args, {
+    cwd = root,
+    text = true,
+    stdout = function(_, data)
+      if log and data then
+        log:write(data)
+        log:flush()
+      end
+    end,
+    stderr = function(_, data)
+      if log and data then
+        log:write(data)
+        log:flush()
+      end
+    end,
+  }, vim.schedule_wrap(function(res)
+    if log then
+      log:close()
+      log = nil
+    end
+    if res.code ~= 0 then
+      notify(vim.log.levels.ERROR,
+        'Failed to build native module (see require("matchup_rs.build").build_log())')
+      return
+    end
+    local dest, err = deploy(u, root, release)
+    if not dest then
+      notify(vim.log.levels.ERROR, 'Build succeeded but deploy failed: ' .. tostring(err))
+      return
+    end
+    notify(vim.log.levels.INFO, 'Successfully built native module (restart nvim to load it).')
+  end))
+end
 
-  local ok, err = copy_over(u, artifact, dest)
-  if not ok then
-    io.stderr:write('build: ' .. err .. '\n')
-    return false
+--- Open the captured build log.
+function M.build_log()
+  local p = log_path()
+  if not uv().fs_stat(p) then
+    notify(vim.log.levels.WARN, 'No build log yet: ' .. p)
+    return
   end
-
-  -- build() only (re)writes the file; a running nvim that already require'd the
-  -- native module keeps the old code until it is restarted.
-  print('build: ' .. artifact .. ' -> ' .. dest)
-  return true
+  vim.cmd('edit ' .. vim.fn.fnameescape(p))
 end
 
 return M
