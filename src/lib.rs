@@ -150,6 +150,49 @@ pub(crate) fn with_ctx_for<R>(
     Some(f(&ctx))
 }
 
+/// One-time activation, guarded by Rust state (`State.activated`): highlight
+/// groups, neutralize matchit / the bundled pi_paren, and define the user
+/// commands. All globals it touches belong to *other* plugins (matchit,
+/// pi_paren) and are set from Rust; matchup-rs keeps no state in vimscript.
+fn activate(state: &SharedState) {
+    if state.is_activated() {
+        return;
+    }
+    state.set_activated();
+
+    // highlight groups (same defaults as vim-matchup)
+    let _ = api::command("hi def link MatchParenCur MatchParen");
+    let _ = api::command("hi def link MatchWord MatchParen");
+    let _ = api::command("hi def link MatchBackground ColorColumn");
+
+    // disable matchit and its bundled mappings
+    let _ = api::set_var("loaded_matchit", 1);
+    let _ = api::command("silent! delcommand MatchDebug");
+    for m in ["%", "[%", "]%", "a%", "g%"] {
+        let _ = api::command(&format!("silent! unmap {m}"));
+    }
+
+    // ensure pi_paren is loaded, then deactivate it (clear its autocmds and
+    // claim its global so it does not re-arm)
+    let _ = api::command("runtime plugin/matchparen.vim");
+    let _ = api::command("silent! au! matchparen");
+    let _ = api::set_var("loaded_matchparen", 1);
+
+    // user commands call the Rust module directly (no vimscript state)
+    let _ = api::command(
+        "command! NoMatchParen lua local m=require('matchup_rs'); m.set_matchparen_enabled(false); m.clear()",
+    );
+    let _ = api::command(
+        "command! DoMatchParen lua local m=require('matchup_rs'); m.set_matchparen_enabled(true); m.clear(); m.update()",
+    );
+    let _ = api::command(
+        "command! MatchupReload lua local m=require('matchup_rs'); m.reload(); m.update()",
+    );
+    let _ = api::command(
+        "command! MatchupShowTimes lua require('matchup_rs').show_times()",
+    );
+}
+
 #[nvim_oxi::plugin]
 fn matchup_rs() -> Result<Dictionary> {
     install_panic_hook();
@@ -356,11 +399,20 @@ fn matchup_rs() -> Result<Dictionary> {
         install_panic_hook();
         guard("setup", || {
             let st = Rc::clone(&s);
+            if nvimrs::call_fn_as::<i64>(
+                "has",
+                &Array::from_iter([Object::from("nvim-0.11.0")]),
+            )
+            .unwrap_or(0)
+                == 0
+            {
+                nvimrs::echo("matchup-rs requires neovim >= 0.11");
+            }
             let gopts = GOpts::from_opts(&GOpts::default(), opts.as_ref());
             st.set_gopts(gopts);
-            // One-time vimscript activation (highlight groups, matchit/pi_paren
+            // One-time activation (highlight groups, matchit/pi_paren
             // neutralization, user commands). Idempotent across re-setup.
-            let _ = api::command("call matchup#rs#activate()");
+            activate(&st);
             ftplugin::setup(&st);
             matchparen::setup(&st);
             motion::setup(&st);
@@ -508,6 +560,72 @@ fn matchup_rs() -> Result<Dictionary> {
             Ok(())
         });
 
+    // Introspection: the resolved per-buffer config the engine actually uses
+    // (Rust FtConfig, falling back to nvim-runtime/user b: inputs). Used by the
+    // test harnesses now that the plugin no longer writes b: config vars.
+    let s = Rc::clone(&state);
+    let buffer_config: Function<(), Object> =
+        Function::from_fn(move |()| -> nvim_oxi::Result<Object> {
+        Ok(guard("buffer_config", || -> Object {
+            let buf = api::get_current_buf();
+            let h = buf.handle();
+            let ftc = s.ft_config(h);
+            let bvar = |n: &str| buf.get_var::<String>(n).unwrap_or_default();
+            let mw = ftc.match_words.clone().unwrap_or_else(|| bvar("match_words"));
+            let ms = ftc.match_skip.clone().unwrap_or_else(|| bvar("match_skip"));
+            let mp = nvimrs::get_option_as::<String>("matchpairs", h, 0).unwrap_or_default();
+            let ic = buf
+                .get_var::<i64>("match_ignorecase")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let mpe = match ftc.matchparen_enabled {
+                Some(b) => if b { "1" } else { "0" }.to_string(),
+                None => String::new(),
+            };
+            let mm = ftc.midmap.map(|pairs| {
+                Object::from(Array::from_iter(pairs.into_iter().map(|(a, b)| {
+                    Object::from(Array::from_iter([Object::from(a), Object::from(b)]))
+                })))
+            });
+            let mut d = Dictionary::from_iter([
+                ("match_words", Object::from(mw)),
+                ("match_skip", Object::from(ms)),
+                ("matchpairs", Object::from(mp)),
+                ("ignorecase", Object::from(ic)),
+                ("nomatchpairs", Object::from(ftc.nomatchpairs)),
+                ("matchparen_enabled", Object::from(mpe)),
+            ]);
+            if let Some(mm) = mm {
+                d.insert("midmap", mm);
+            }
+            Object::from(d)
+        }))
+        });
+
+    // Effective cursor position for raw b:match_skip evaluation, held in Rust
+    // (State.eff_curpos); the matchup#rs#effline/effcol shims read it back.
+    let s = Rc::clone(&state);
+    let eff_pos: Function<(), Object> = Function::from_fn(move |()| -> nvim_oxi::Result<Object> {
+        Ok(guard("eff_pos", || -> Object {
+            let (l, c) = s.eff_pos();
+            Object::from(Array::from_iter([Object::from(l), Object::from(c)]))
+        }))
+    });
+
+    // Offscreen statusline scroll-refresh timer (id held in Rust state).
+    let s = Rc::clone(&state);
+    let scroll_callback: Function<(i64,), ()> =
+        Function::from_fn(move |(tid,)| -> nvim_oxi::Result<()> {
+            guard("scroll_callback", || matchparen::scroll_callback(&s, tid));
+            Ok(())
+        });
+
+    let s = Rc::clone(&state);
+    let scroll_update: Function<(i64,), String> =
+        Function::from_fn(move |(lnum,)| -> nvim_oxi::Result<String> {
+            Ok(guard("scroll_update", || matchparen::scroll_update(&s, lnum)))
+        });
+
     Ok(Dictionary::from_iter([
         ("version", Object::from(env!("CARGO_PKG_VERSION"))),
         ("setup", Object::from(setup)),
@@ -524,6 +642,10 @@ fn matchup_rs() -> Result<Dictionary> {
         ("matchpref", Object::from(matchpref)),
         ("apply_ftplugin", Object::from(apply_ftplugin)),
         ("show_times", Object::from(show_times)),
+        ("buffer_config", Object::from(buffer_config)),
+        ("eff_pos", Object::from(eff_pos)),
+        ("scroll_callback", Object::from(scroll_callback)),
+        ("scroll_update", Object::from(scroll_update)),
         ("timer_callback", Object::from(timer_callback)),
         ("fade_timer_callback", Object::from(fade_timer_callback)),
         ("update_insert", Object::from(update_insert)),

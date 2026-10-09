@@ -148,6 +148,7 @@ pub fn syn_name(lnum: usize, cnum: usize, translate_id: bool) -> String {
 /// lnum. Returns the raw expression value; the caller applies
 /// invert_skip (XOR), mirroring matchup#delim#skip (delim.vim:868).
 pub fn skip_at(
+    state: &crate::state::State,
     kind: &SkipKind,
     line: &str,
     lnum: usize,
@@ -177,16 +178,15 @@ pub fn skip_at(
             re.is_match(&line[..end]).unwrap_or(false) != *invert
         }
         SkipKind::Raw { expr } => {
-            // The shim evaluates the raw b:match_skip expression at an
-            // effective position (arbitrary vimscript, as upstream does with
-            // `execute 'return'`); invoke it natively via nvim_call_function.
+            // The shim evaluates the raw b:match_skip expression (arbitrary
+            // vimscript, as upstream does with `execute 'return'`). The
+            // effective position lives in Rust (State.eff_curpos); the shim's
+            // effline/effcol read it back so line('.')/col('.') resolve at the
+            // candidate delimiter rather than the real cursor.
+            state.set_eff_pos(lnum as i64, cnum as i64);
             let r: i64 = crate::nvimrs::call_fn_as(
                 "matchup#rs#skip_eval",
-                &Array::from_iter([
-                    Object::from(expr.as_str()),
-                    Object::from(lnum as i64),
-                    Object::from(cnum as i64),
-                ]),
+                &Array::from_iter([Object::from(expr.as_str())]),
             )
             .unwrap_or(0);
             r != 0

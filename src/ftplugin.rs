@@ -18,13 +18,22 @@ use std::rc::Rc;
 use nvim_oxi::api::{self, Buffer};
 use nvim_oxi::{Array, Object};
 
-use crate::state::{GOpts, State};
+use crate::state::{FtConfig, GOpts, State};
 
 type SharedState = Rc<State>;
 
 // ---------------------------------------------------------------------------
-// buffer helpers
+// config builder
 // ---------------------------------------------------------------------------
+
+/// Mutable context threaded through the per-filetype handlers: the config
+/// being built (stored in Rust, never in `b:` vars), plus the buffer for
+/// option reads/writes and runtime `b:` inputs, and the setup(opts) prefs.
+struct Ft<'a> {
+    cfg: FtConfig,
+    buf: &'a Buffer,
+    gopts: &'a GOpts,
+}
 
 fn buf_str(buf: &Buffer, name: &str) -> Option<String> {
     buf.get_var::<String>(name).ok()
@@ -32,14 +41,6 @@ fn buf_str(buf: &Buffer, name: &str) -> Option<String> {
 
 fn buf_exists(buf: &Buffer, name: &str) -> bool {
     buf.get_var::<Object>(name).is_ok()
-}
-
-fn set_str(buf: &Buffer, name: &str, val: &str) {
-    let _ = buf.clone().set_var(name, val.to_string());
-}
-
-fn set_i64(buf: &Buffer, name: &str, val: i64) {
-    let _ = buf.clone().set_var(name, val);
 }
 
 /// Read a buffer-scoped option natively (nvim_get_option_value).
@@ -59,49 +60,49 @@ fn set_buf_opt(buf: &Buffer, name: &str, val: &str) {
     ));
 }
 
-/// Port of matchup#util#patch_match_words: substitute the first literal
-/// occurrence of `from` with `to` in b:match_words (no-op if absent/unset).
-fn patch(buf: &Buffer, from: &str, to: &str) {
-    let mw = match buf_str(buf, "match_words") {
-        Some(m) => m,
-        None => return,
-    };
-    if let Some(idx) = mw.find(from) {
-        let mut out = String::with_capacity(mw.len());
-        out.push_str(&mw[..idx]);
-        out.push_str(to);
-        out.push_str(&mw[idx + from.len()..]);
-        let _ = buf.clone().set_var("match_words", out);
+/// The match_words being built, seeded lazily from the runtime base
+/// `b:match_words` (nvim/matchit input) on first modification.
+fn mw<'f, 'b>(f: &'f mut Ft<'b>) -> &'f mut String {
+    if f.cfg.match_words.is_none() {
+        f.cfg.match_words = Some(buf_str(f.buf, "match_words").unwrap_or_default());
     }
+    f.cfg.match_words.as_mut().unwrap()
 }
 
-/// Port of matchup#util#append_match_words.
-fn append(buf: &Buffer, s: &str) {
-    let mut mw = buf_str(buf, "match_words").unwrap_or_default();
+/// Append a delimiter set with a comma separator (port of
+/// matchup#util#append_match_words).
+fn append(f: &mut Ft, s: &str) {
+    let mw = mw(f);
     if !mw.is_empty() && !mw.ends_with(',') && !s.starts_with(',') {
         mw.push(',');
     }
     mw.push_str(s);
-    let _ = buf.clone().set_var("match_words", mw);
 }
 
-/// Port of matchup#util#check_match_words: true when b:match_words exists and
-/// its sha256() begins with `prefix`. Uses Vim's sha256() so the digest guards
-/// (which track the runtime ftplugin's exact b:match_words) stay valid.
+/// Replace the FIRST literal occurrence of `from` with `to` (port of
+/// matchup#util#patch_match_words).
+fn patch(f: &mut Ft, from: &str, to: &str) {
+    let mw = mw(f);
+    if let Some(idx) = mw.find(from) {
+        mw.replace_range(idx..idx + from.len(), to);
+    }
+}
+
+/// True when the runtime base `b:match_words` sha256 begins with `prefix`
+/// (port of matchup#util#check_match_words). Uses Vim's sha256() so the digest
+/// guards tracking the runtime ftplugin's exact b:match_words stay valid.
 fn check(buf: &Buffer, prefix: &str) -> bool {
-    let mw = match buf_str(buf, "match_words") {
+    let m = match buf_str(buf, "match_words") {
         Some(m) => m,
         None => return false,
     };
-    // Native sha256() via nvim_call_function; the digest guards track the
-    // runtime ftplugin's exact b:match_words.
     let hash: String =
-        crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(mw)]))
+        crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(m)]))
             .unwrap_or_default();
     hash.starts_with(prefix)
 }
 
-/// Port of matchup#util#matchpref, reading the setup(opts) matchpref table.
+/// Per-filetype pref from setup(opts) (port of matchup#util#matchpref).
 fn matchpref(gopts: &GOpts, ft: &str, id: &str, default: bool) -> bool {
     gopts
         .matchpref
@@ -111,98 +112,84 @@ fn matchpref(gopts: &GOpts, ft: &str, id: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// Append to b:undo_ftplugin so a later filetype change clears our vars.
-fn add_undo(buf: &Buffer, cmd: &str) {
-    let mut u = buf_str(buf, "undo_ftplugin").unwrap_or_default();
-    if !u.is_empty() {
-        u.push('|');
-    }
-    u.push_str(cmd);
-    let _ = buf.clone().set_var("undo_ftplugin", u);
-}
-
-fn set_midmap(buf: &Buffer, pairs: &[(&str, &str)]) {
-    let arr = Array::from_iter(pairs.iter().map(|(a, b)| {
-        Object::from(Array::from_iter([Object::from(*a), Object::from(*b)]))
-    }));
-    let _ = buf.clone().set_var("match_midmap", arr);
+fn set_midmap(f: &mut Ft, pairs: &[(&str, &str)]) {
+    f.cfg.midmap = Some(
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect(),
+    );
 }
 
 // ---------------------------------------------------------------------------
 // per-filetype definitions
 // ---------------------------------------------------------------------------
 
-fn ft_c(buf: &Buffer) {
-    if check(buf, "bb2bcbee") {
-        append(buf, r"/\*:\*/");
+fn ft_c(f: &mut Ft) {
+    if check(f.buf, "bb2bcbee") {
+        append(f, r"/\*:\*/");
     }
 }
 
-fn ft_javascript(buf: &Buffer) {
-    if check(buf, "802f71c1") {
-        append(buf, r"/\*:\*/");
+fn ft_javascript(f: &mut Ft) {
+    if check(f.buf, "802f71c1") {
+        append(f, r"/\*:\*/");
     }
 }
 
-fn ft_cpp(gopts: &GOpts, buf: &Buffer) {
-    if matchpref(gopts, "cpp", "template", false) {
-        append(buf, r"\%(\s\@<!<\|<\s\@!\)[=(]\@!:\%(\s\@<!>\|>\s\@!\)=\@!");
+fn ft_cpp(f: &mut Ft) {
+    if matchpref(f.gopts, "cpp", "template", false) {
+        append(f, r"\%(\s\@<!<\|<\s\@!\)[=(]\@!:\%(\s\@<!>\|>\s\@!\)=\@!");
         // `setlocal matchpairs-=<:>` unless "<:>" sits at index 0 (faithful to
         // the original's `if stridx(&matchpairs, '<:>')`, which is truthy for
         // "absent" (-1) and "found later" (>0) but falsy at index 0).
-        let mp = buf_opt(buf, "matchpairs");
+        let mp = buf_opt(f.buf, "matchpairs");
         if mp.find("<:>").map(|i| i as i64).unwrap_or(-1) != 0 {
             let kept: Vec<&str> = mp.split(',').filter(|p| *p != "<:>").collect();
-            set_buf_opt(buf, "matchpairs", &kept.join(","));
+            set_buf_opt(f.buf, "matchpairs", &kept.join(","));
         }
     }
 }
 
-fn ft_fortran(buf: &Buffer) {
-    patch(buf, r"\<if", r"\<if\>\g{hlend}");
-    patch(buf, r"\<else\s*\%(if", r"\<else\g{hlend}\s*\%(if\g{hlend}");
+fn ft_fortran(f: &mut Ft) {
+    patch(f, r"\<if", r"\<if\>\g{hlend}");
+    patch(f, r"\<else\s*\%(if", r"\<else\g{hlend}\s*\%(if\g{hlend}");
     append(
-        buf,
+        f,
         r"^\s*#\s*if\(\|def\|ndef\)\>:^\s*#\s*elif\>:^\s*#\s*else\>:^\s*#\s*endif\>",
     );
 }
 
-fn ft_ruby(buf: &Buffer) {
-    patch(buf, "retry", r"retry\|return");
-    set_midmap(buf, &[("rubyRepeat", "next"), ("rubyDefine", "return")]);
-    if buf_exists(buf, "undo_ftplugin") {
-        add_undo(buf, "unlet! b:match_midmap");
-    }
+fn ft_ruby(f: &mut Ft) {
+    patch(f, "retry", r"retry\|return");
+    set_midmap(f, &[("rubyRepeat", "next"), ("rubyDefine", "return")]);
 }
 
-fn ft_lua(buf: &Buffer) {
-    set_midmap(buf, &[("luaFunction", "return")]);
-    add_undo(buf, " unlet! b:match_midmap");
-    append(buf, r"--\[\(=*\)\[:]\1]");
+fn ft_lua(f: &mut Ft) {
+    set_midmap(f, &[("luaFunction", "return")]);
+    append(f, r"--\[\(=*\)\[:]\1]");
 }
 
-fn ft_janet(buf: &Buffer) {
-    append(buf, r"``:``\g{syn;!JanetString}");
+fn ft_janet(f: &mut Ft) {
+    append(f, r"``:``\g{syn;!JanetString}");
 }
 
-fn ft_ocaml(buf: &Buffer) {
-    set_i64(buf, "matchup_matchparen_timeout", 100);
-    add_undo(buf, " unlet! b:matchup_matchparen_timeout");
+fn ft_ocaml(f: &mut Ft) {
+    f.cfg.matchparen_timeout = Some(100);
 }
 
-fn ft_vim(buf: &Buffer) {
-    set_str(
-        buf,
-        "match_skip",
-        r"s:comment\|string\|vimSynReg\|vimSet\|vimFuncName\|vimNotPatSep\|vimVar\|vimFuncVar\|vimFBVar\|vimOperParen\|vimUserFunc",
+fn ft_vim(f: &mut Ft) {
+    f.cfg.match_skip = Some(
+        r"s:comment\|string\|vimSynReg\|vimSet\|vimFuncName\|vimNotPatSep\|vimVar\|vimFuncVar\|vimFBVar\|vimOperParen\|vimUserFunc"
+            .to_string(),
     );
     patch(
-        buf,
+        f,
         r"\<aug\%[roup]\s\+\%(END\>\)\@!\S:",
         r"\<aug\%[roup]\ze\s\+\%(END\>\)\@!\S:",
     );
     patch(
-        buf,
+        f,
         r"\|def\)!\=\s\+",
         r"\|\%(export\s\+\)\@<!def\|export\s\+def\)\ze!\=\s\+",
     );
@@ -210,54 +197,54 @@ fn ft_vim(buf: &Buffer) {
 
 /// The four patches shared by html/xml/jsx/tsx under matchpref('tagnameonly').
 /// html uses a different set; xml/jsx/tsx share this exact sequence.
-fn tagnameonly_xmlish(buf: &Buffer) {
-    patch(buf, r"\)\%(", r"\)\g{hlend}\%(");
-    patch(buf, r"\)\%(", r"\)\g{hlend}\%(");
-    patch(buf, "1>", r"1\g{hlend}>");
-    patch(buf, ":/>", r":/\g{hlend}>");
+fn tagnameonly_xmlish(f: &mut Ft) {
+    patch(f, r"\)\%(", r"\)\g{hlend}\%(");
+    patch(f, r"\)\%(", r"\)\g{hlend}\%(");
+    patch(f, "1>", r"1\g{hlend}>");
+    patch(f, ":/>", r":/\g{hlend}>");
 }
 
-fn ft_xml(gopts: &GOpts, buf: &Buffer) {
-    if matchpref(gopts, "xml", "tagnameonly", false) {
-        tagnameonly_xmlish(buf);
+fn ft_xml(f: &mut Ft) {
+    if matchpref(f.gopts, "xml", "tagnameonly", false) {
+        tagnameonly_xmlish(f);
     }
-    patch(buf, "[^/>]*", "[^>]*[^/>]");
+    patch(f, "[^/>]*", "[^>]*[^/>]");
 }
 
-fn ft_tsx(gopts: &GOpts, buf: &Buffer) {
-    set_str(buf, "match_skip", r"s:\%(comment\|string\)\%(tsxCloseString\)\@<!");
-    if matchpref(gopts, "typescriptreact", "tagnameonly", false) {
-        tagnameonly_xmlish(buf);
-    }
-}
-
-fn ft_jsx(gopts: &GOpts, buf: &Buffer) {
-    set_str(buf, "match_skip", r"s:\%(comment\|string\)\%(jsxCloseString\)\@<!");
-    if matchpref(gopts, "javascriptreact", "tagnameonly", false) {
-        tagnameonly_xmlish(buf);
+fn ft_tsx(f: &mut Ft) {
+    f.cfg.match_skip = Some(r"s:\%(comment\|string\)\%(tsxCloseString\)\@<!".to_string());
+    if matchpref(f.gopts, "typescriptreact", "tagnameonly", false) {
+        tagnameonly_xmlish(f);
     }
 }
 
-fn ft_html(gopts: &GOpts, buf: &Buffer, ft: &str) {
+fn ft_jsx(f: &mut Ft) {
+    f.cfg.match_skip = Some(r"s:\%(comment\|string\)\%(jsxCloseString\)\@<!".to_string());
+    if matchpref(f.gopts, "javascriptreact", "tagnameonly", false) {
+        tagnameonly_xmlish(f);
+    }
+}
+
+fn ft_html(f: &mut Ft, ft: &str) {
     patch(
-        buf,
+        f,
         r"[^ \t>]*\)[^>]*\%(>\|$\):<\@<=/\1>",
         r"[^ \t>]*\)\%(>\|$\|[ \t][^>]*\%(>\|$\)\):<\@<=/\1>",
     );
     // default folded from g:matchup_matchpref_html_nolists -> false (clean break).
     // matchpref is keyed on the ACTUAL filetype, so vue/htmlangular look up
     // their own prefs (as html_matchup.vim does via &filetype), not "html".
-    if matchpref(gopts, ft, "nolists", false) {
-        patch(buf, r"<\@<=[ou]l\>[^>]*\%(>\|$\):<\@<=li\>:<\@<=/[ou]l>", "");
-        patch(buf, r"<\@<=dl\>[^>]*\%(>\|$\):<\@<=d[td]\>:<\@<=/dl>", "");
+    if matchpref(f.gopts, ft, "nolists", false) {
+        patch(f, r"<\@<=[ou]l\>[^>]*\%(>\|$\):<\@<=li\>:<\@<=/[ou]l>", "");
+        patch(f, r"<\@<=dl\>[^>]*\%(>\|$\):<\@<=d[td]\>:<\@<=/dl>", "");
     }
-    if matchpref(gopts, ft, "tagnameonly", false) {
-        patch(buf, r"\)\%(", r"\)\g{hlend}\%(");
-        patch(buf, r"]l\>[", r"]l\>\g{hlend}[");
-        patch(buf, r"dl\>", r"dl\>\g{hlend}");
-        patch(buf, "1>", r"1\g{hlend}>");
-        patch(buf, "]l>", r"]l\g{hlend}>");
-        patch(buf, "dl>", r"dl\g{hlend}>");
+    if matchpref(f.gopts, ft, "tagnameonly", false) {
+        patch(f, r"\)\%(", r"\)\g{hlend}\%(");
+        patch(f, r"]l\>[", r"]l\>\g{hlend}[");
+        patch(f, r"dl\>", r"dl\>\g{hlend}");
+        patch(f, "1>", r"1\g{hlend}>");
+        patch(f, "]l>", r"]l\g{hlend}>");
+        patch(f, "dl>", r"dl\g{hlend}>");
     }
 }
 
@@ -389,19 +376,14 @@ fn tex_match_words(gopts: &GOpts, buf: &Buffer) -> String {
     mw
 }
 
-fn tex_setup_match_words(buf: &Buffer) {
-    set_buf_opt(buf, "matchpairs", "(:),{:},[:]");
-    set_i64(buf, "matchup_delim_nomatchpairs", 1);
+fn tex_setup_match_words(f: &mut Ft) {
+    set_buf_opt(f.buf, "matchpairs", "(:),{:},[:]");
+    f.cfg.nomatchpairs = true;
     // match_words is set by the caller (needs gopts for matchpref)
-    set_str(buf, "match_skip", r"r:\\\@<!\%(\\\\\)*%");
-    set_i64(buf, "matchup_regexpengine", 1);
-    add_undo(
-        buf,
-        "unlet! b:matchup_delim_nomatchpairs b:match_words b:match_skip b:matchup_regexpengine",
-    );
+    f.cfg.match_skip = Some(r"r:\\\@<!\%(\\\\\)*%".to_string());
 }
 
-fn ft_tex(gopts: &GOpts, buf: &Buffer) {
+fn ft_tex(f: &mut Ft) {
     // vimtex detection reads external plugin state (not a matchup option):
     // g:vimtex_enabled override, else exists('*vimtex#init')/g:vimtex_version.
     let vimtex_active = crate::nvimrs::get_var_as::<i64>("vimtex_enabled")
@@ -415,7 +397,7 @@ fn ft_tex(gopts: &GOpts, buf: &Buffer) {
                 != 0
                 || crate::nvimrs::get_var_as::<Object>("vimtex_version").is_some()
         });
-    let override_vimtex = matchpref(gopts, "tex", "override_vimtex", false);
+    let override_vimtex = matchpref(f.gopts, "tex", "override_vimtex", false);
 
     if vimtex_active {
         if override_vimtex {
@@ -424,17 +406,16 @@ fn ft_tex(gopts: &GOpts, buf: &Buffer) {
             );
             let _ = api::set_var("vimtex_matchparen_enabled", 0);
             let _ = api::command("silent! call vimtex#matchparen#disable()");
-            tex_setup_match_words(buf);
-            let mw = tex_match_words(gopts, buf);
-            set_str(buf, "match_words", &mw);
+            tex_setup_match_words(f);
+            let mww = tex_match_words(f.gopts, f.buf);
+            f.cfg.match_words = Some(mww);
         } else {
-            set_i64(buf, "matchup_matchparen_enabled", 0);
-            set_i64(buf, "matchup_matchparen_fallback", 0);
+            f.cfg.matchparen_enabled = Some(false);
         }
     } else {
-        tex_setup_match_words(buf);
-        let mw = tex_match_words(gopts, buf);
-        set_str(buf, "match_words", &mw);
+        tex_setup_match_words(f);
+        let mww = tex_match_words(f.gopts, f.buf);
+        f.cfg.match_words = Some(mww);
     }
 }
 
@@ -442,30 +423,33 @@ fn ft_tex(gopts: &GOpts, buf: &Buffer) {
 // dispatch + autocmd
 // ---------------------------------------------------------------------------
 
-/// Apply the filetype definition for `buf` (its `&filetype`).
+/// Apply the filetype definition for `buf` (its `&filetype`), storing the
+/// derived config in Rust (`State.ft_config`) rather than in `b:` vars.
 fn apply(state: &SharedState, buf: &Buffer) {
     if !buf_exists(buf, "did_ftplugin") {
         return;
     }
     let ft = buf_opt(buf, "filetype");
     let gopts = state.gopts();
+    let mut f = Ft { cfg: FtConfig::default(), buf, gopts: &gopts };
     match ft.as_str() {
-        "c" => ft_c(buf),
-        "cpp" => ft_cpp(&gopts, buf),
-        "fortran" => ft_fortran(buf),
-        "html" | "vue" | "htmlangular" => ft_html(&gopts, buf, &ft),
-        "janet" => ft_janet(buf),
-        "javascript" => ft_javascript(buf),
-        "javascriptreact" => ft_jsx(&gopts, buf),
-        "lua" => ft_lua(buf),
-        "ocaml" => ft_ocaml(buf),
-        "ruby" => ft_ruby(buf),
-        "tex" => ft_tex(&gopts, buf),
-        "typescriptreact" => ft_tsx(&gopts, buf),
-        "vim" => ft_vim(buf),
-        "xml" => ft_xml(&gopts, buf),
+        "c" => ft_c(&mut f),
+        "cpp" => ft_cpp(&mut f),
+        "fortran" => ft_fortran(&mut f),
+        "html" | "vue" | "htmlangular" => ft_html(&mut f, &ft),
+        "janet" => ft_janet(&mut f),
+        "javascript" => ft_javascript(&mut f),
+        "javascriptreact" => ft_jsx(&mut f),
+        "lua" => ft_lua(&mut f),
+        "ocaml" => ft_ocaml(&mut f),
+        "ruby" => ft_ruby(&mut f),
+        "tex" => ft_tex(&mut f),
+        "typescriptreact" => ft_tsx(&mut f),
+        "vim" => ft_vim(&mut f),
+        "xml" => ft_xml(&mut f),
         _ => {}
     }
+    state.set_ft_config(buf.handle(), f.cfg);
 }
 
 /// Entry point for the FileType autocmd / manual apply: current buffer.

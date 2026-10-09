@@ -349,7 +349,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // check_skip determination (delim.vim:387-400)
     let cursor_skip = {
         let line = ctx.lines.get1(cur.lnum).unwrap_or("");
-        skip_at(&ctx.bc.skip, line, cur.lnum, cursorpos.min(line.len().max(1)), ctx.syntax_on)
+        skip_at(ctx.state, &ctx.bc.skip, line, cur.lnum, cursorpos.min(line.len().max(1)), ctx.syntax_on)
     };
     let noskips = ctx.gopts.delim_noskips;
     let check_skip = opts.check_skip.unwrap_or(match opts.direction {
@@ -505,7 +505,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // skip state recorded on the delim (delim.vim:486-496)
     let mut skip_state = false;
     if !check_skip && (ctx.synmaxcol == 0 || hit.cnum() as i64 <= ctx.synmaxcol) {
-        skip_state = skip_at(&ctx.bc.skip, line, hit.lnum, hit.cnum(), ctx.syntax_on);
+        skip_state = skip_at(ctx.state, &ctx.bc.skip, line, hit.lnum, hit.cnum(), ctx.syntax_on);
     }
 
     ctx.state.perf.toc("s:get_delim", "got_results");
@@ -560,7 +560,7 @@ fn reject_by_skip(ctx: &Ctx, h: Hit, line: &str, check_skip: bool, forward: bool
     if !should_check {
         return false;
     }
-    if !skip_at(&ctx.bc.skip, line, h.lnum, h.cnum(), ctx.syntax_on) {
+    if !skip_at(ctx.state, &ctx.bc.skip, line, h.lnum, h.cnum(), ctx.syntax_on) {
         return false;
     }
     // at buffer edges, accept anyway (delim.vim:448-449)
@@ -838,7 +838,7 @@ pub fn get_matching_raw(
     let same = open_v == close_v;
 
     let skipfn = |lnum: usize, cnum: usize, line: &str| -> bool {
-        let base = || skip_at(&ctx.bc.skip, line, lnum, cnum, ctx.syntax_on) != invert;
+        let base = || skip_at(ctx.state, &ctx.bc.skip, line, lnum, cnum, ctx.syntax_on) != invert;
         match &mid_skip {
             Some(ms) => ms.eval(line, lnum, cnum, base),
             None => base(),
@@ -1576,7 +1576,7 @@ pub fn get_surrounding(
 
     let cursor_skip = {
         let line = ctx.lines.get1(cursor.lnum).unwrap_or("");
-        skip_at(&ctx.bc.skip, line, cursor.lnum, cursor.cnum, ctx.syntax_on)
+        skip_at(ctx.state, &ctx.bc.skip, line, cursor.lnum, cursor.cnum, ctx.syntax_on)
     };
     let check_skip = if opts.check_skip {
         Some(true)

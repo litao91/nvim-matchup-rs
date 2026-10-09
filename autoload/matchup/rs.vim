@@ -1,31 +1,35 @@
-" vim match-up (Rust engine) - vimscript shims for the Rust module
+" vim match-up (Rust engine) - stateless vimscript shims
 "
-" These functions bridge the Rust engine (matchup_rs) back into
-" vimscript for the few things that must run there: timer callbacks,
-" raw skip-expression evaluation at effective positions, and the
-" indentexpr detection trick.
+" These bridge the Rust engine into vimscript for the few operations that must
+" run there: timer callbacks, raw b:match_skip eval() at an effective position,
+" the operator-pending `normal` re-feed, and the indentexpr throwpoint trick.
+" ALL plugin state and config lives in Rust (the `State` struct); nothing here
+" stores state.
 
-let s:eff_curpos = [1, 1]
-
+" Effective-position accessors. The candidate position is held in Rust
+" (State.eff_curpos) and set there before matchup#rs#skip_eval runs; these read
+" it back so a raw b:match_skip expression's line('.')/col('.')/getline('.')
+" resolve at the candidate delimiter rather than the real cursor.
 function! matchup#rs#effline(expr) abort
-  return a:expr ==# '.' ? s:eff_curpos[0] : line(a:expr)
+  return a:expr ==# '.' ? luaeval("require('matchup_rs').eff_pos()[1]") : line(a:expr)
 endfunction
 
 function! matchup#rs#effcol(expr) abort
-  return a:expr ==# '.' ? s:eff_curpos[1] : col(a:expr)
+  return a:expr ==# '.' ? luaeval("require('matchup_rs').eff_pos()[2]") : col(a:expr)
 endfunction
 
 function! matchup#rs#geteffline(expr) abort
-  return a:expr ==# '.' ? getline(s:eff_curpos[0]) : getline(a:expr)
+  return a:expr ==# '.'
+        \ ? getline(luaeval("require('matchup_rs').eff_pos()[1]"))
+        \ : getline(a:expr)
 endfunction
 
-" Evaluate a raw b:match_skip expression at an effective position.
-" SECURITY NOTE: mirrors vim-matchup, which evaluates b:matchup_delim_skip
-" with `execute 'return' ...` (delim.vim:881). The expression comes from
-" buffer-local ftplugin config; setting it already implies vimscript
-" execution capability.
-function! matchup#rs#skip_eval(expr, lnum, cnum) abort
-  let s:eff_curpos = [a:lnum, a:cnum]
+" Evaluate a raw b:match_skip expression. Rust has already stored the effective
+" position, so effline/effcol above resolve correctly during the eval.
+" SECURITY NOTE: mirrors vim-matchup, which evaluates b:matchup_delim_skip with
+" `execute 'return' ...` (delim.vim:881). The expression comes from buffer-local
+" ftplugin config; setting it already implies vimscript execution capability.
+function! matchup#rs#skip_eval(expr) abort
   try
     return eval(a:expr) ? 1 : 0
   catch
@@ -33,49 +37,30 @@ function! matchup#rs#skip_eval(expr, lnum, cnum) abort
   endtry
 endfunction
 
-" deferred-highlight debounce timer callback
+" Debounce timer callbacks (the timer ids are held in Rust state).
 function! matchup#rs#timer_cb(tid) abort
   call luaeval("require('matchup_rs').timer_callback(_A)", a:tid)
 endfunction
 
-" fade timer callback
 function! matchup#rs#fade_timer_cb(tid) abort
   call luaeval("require('matchup_rs').fade_timer_callback(_A)", a:tid)
 endfunction
 
-" offscreen statusline scroll refresh (port of matchparen.vim:1140-1168):
-" a paused 50ms repeating timer, unpaused by the %{...scroll_update(N)}
-" statusline expression when the offscreen line scrolls into view
-function! matchup#rs#ensure_scroll_timer() abort
-  if has('timers') && exists('*timer_pause')
-    if !exists('s:scroll_timer')
-      let s:scroll_timer = timer_start(50,
-            \ 'matchup#rs#scroll_callback', { 'repeat': -1 })
-      call timer_pause(s:scroll_timer, 1)
-    endif
-  endif
-  return exists('s:scroll_timer')
-endfunction
-
+" Offscreen statusline scroll refresh: the timer id lives in Rust
+" (State.scroll_timer); these just forward to the Rust handlers.
 function! matchup#rs#scroll_callback(tid) abort
-  call timer_pause(a:tid, 1)
-  lua require('matchup_rs').highlight(true)
+  call luaeval("require('matchup_rs').scroll_callback(_A)", a:tid)
 endfunction
 
 function! matchup#rs#scroll_update(lnum) abort
-  if line('w0') <= a:lnum && a:lnum <= line('w$')
-        \ && exists('s:scroll_timer')
-    call timer_pause(s:scroll_timer, 0)
-  endif
-  return ''
+  return luaeval("require('matchup_rs').scroll_update(_A)", a:lnum)
 endfunction
 
-" Re-feed keys for an operator-pending motion (port of matchup#motion#op):
-" g:mrs_op_args = [wise, count, plugname]
-function! matchup#rs#op_exec() abort
-  let [l:wise, l:count, l:plug] = g:mrs_op_args
-  execute 'normal' l:wise . (l:count > 0 ? l:count : '')
-        \ . "\<Plug>(" . l:plug . ")"
+" Re-feed keys for an operator-pending motion (port of matchup#motion#op).
+" Args are passed directly from Rust (no global state).
+function! matchup#rs#op_exec(wise, count, plug) abort
+  execute 'normal' a:wise . (a:count > 0 ? a:count : '')
+        \ . "\<Plug>(" . a:plug . ")"
 endfunction
 
 " true while evaluating an indent expression (motion.vim:152 trick)
@@ -94,70 +79,6 @@ endfunction
 function! matchup#rs#text_obj_undo(seq) abort
   if undotree().seq_cur > a:seq
     silent! undo
-  endif
-endfunction
-
-" One-time activation, invoked from the Rust setup(): claims the vim-matchup
-" global, defines highlight groups, neutralizes matchit/pi_paren, and
-" registers the user commands. Idempotent across repeated setup() calls.
-function! matchup#rs#activate() abort
-  if get(s:, 'activated', 0)
-    return
-  endif
-  let s:activated = 1
-
-  " claim vim-matchup's global so the original plugin yields if both are
-  " installed (our filetype definitions are native; see src/ftplugin.rs)
-  let g:loaded_matchup = 1
-
-  " highlight groups (same defaults as vim-matchup)
-  hi def link MatchParenCur MatchParen
-  hi def link MatchWord MatchParen
-  hi def link MatchBackground ColorColumn
-
-  " disable matchit / the bundled matchit plugin (port of unmatchit.vim)
-  let g:loaded_matchit = 1
-  if exists(':MatchDebug')
-    delcommand MatchDebug
-  endif
-  silent! unmap %
-  silent! unmap [%
-  silent! unmap ]%
-  silent! unmap a%
-  silent! unmap g%
-
-  " ensure pi_paren is loaded but deactivated (as in vim-matchup)
-  try
-    runtime plugin/matchparen.vim
-    au! matchparen
-  catch /^Vim\%((\a\+)\)\=:E216/
-    unlet! g:loaded_matchparen
-    runtime plugin/matchparen.vim
-    silent! au! matchparen
-    let g:loaded_matchparen = 1
-  endtry
-
-  " commands
-  command! NoMatchParen call matchup#rs#toggle(0)
-  command! DoMatchParen call matchup#rs#toggle(1)
-  command! MatchupReload call luaeval("require('matchup_rs').reload()")
-        \ | call luaeval("require('matchup_rs').update()")
-  command! MatchupShowTimes call luaeval("require('matchup_rs').show_times()")
-endfunction
-
-" offscreen statusline helper (compat with vim-matchup)
-function! MatchupStatusOffscreen() abort
-  return substitute(get(w:, 'matchup_statusline', ''),
-        \ '%<\|%#\w*#', '', 'g')
-endfunction
-
-" :NoMatchParen / :DoMatchParen
-function! matchup#rs#toggle(val) abort
-  call luaeval("require('matchup_rs').set_matchparen_enabled(_A)",
-        \ a:val ? v:true : v:false)
-  call luaeval("require('matchup_rs').clear()")
-  if a:val
-    call luaeval("require('matchup_rs').update()")
   endif
 endfunction
 

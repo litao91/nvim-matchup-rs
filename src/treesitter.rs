@@ -805,16 +805,6 @@ pub fn active_lang(state: &State, gopts: &GOpts, bufnr: i32) -> Option<String> {
     }
     let lang = ft.clone();
     let verdict = (|| -> Option<String> {
-        let buf_ok: i64 =
-            crate::nvimrs::buf_get_var_as::<i64>(bufnr, "matchup_treesitter_enabled")
-                .or_else(|| {
-                    crate::nvimrs::buf_get_var_as::<bool>(bufnr, "matchup_treesitter_enabled")
-                        .map(|b| b as i64)
-                })
-                .unwrap_or(1);
-        if buf_ok == 0 {
-            return None;
-        }
         if gopts.ts_disabled.iter().any(|d| *d == lang) {
             return None;
         }

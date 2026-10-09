@@ -504,6 +504,22 @@ impl Default for Perf {
 // Global state
 // ---------------------------------------------------------------------------
 
+/// Per-buffer filetype configuration derived by the native ftplugin
+/// (src/ftplugin.rs). This is the plugin's own config, held in Rust rather
+/// than in `b:` variables. `None` fields fall back to nvim-runtime/user input
+/// (base `b:match_words`, `b:match_skip`) still read from the buffer.
+#[derive(Default, Clone)]
+pub struct FtConfig {
+    pub match_words: Option<String>,
+    pub match_skip: Option<String>,
+    pub midmap: Option<Vec<(String, String)>>,
+    pub nomatchpairs: bool,
+    /// Per-buffer matchparen override (tex+vimtex disables it).
+    pub matchparen_enabled: Option<bool>,
+    /// Per-buffer highlight timeout override (janet).
+    pub matchparen_timeout: Option<i64>,
+}
+
 pub struct State {
     /// True while re-feeding keys for an operator-pending motion
     /// (prevents recursion in the op() dance).
@@ -525,6 +541,16 @@ pub struct State {
     pub ts: RefCell<crate::treesitter::TsState>,
     /// Configuration supplied via `require('matchup_rs').setup{...}`.
     pub gopts: RefCell<GOpts>,
+    /// Per-buffer filetype config derived by the native ftplugin (replaces
+    /// the `b:match_*` / `b:matchup_*` buffer variables).
+    pub ft_config: RefCell<HashMap<i32, FtConfig>>,
+    /// One-time vimscript activation guard (highlight groups, commands, ...).
+    pub activated: Cell<bool>,
+    /// Effective cursor position used while evaluating a raw `b:match_skip`
+    /// expression at a candidate delimiter (replaces vimscript `s:eff_curpos`).
+    pub eff_curpos: Cell<(i64, i64)>,
+    /// Offscreen-statusline scroll-refresh timer id (replaces `s:scroll_timer`).
+    pub scroll_timer: Cell<Option<i64>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -558,6 +584,10 @@ impl State {
             perf: Perf::new(),
             ts: RefCell::new(Default::default()),
             gopts: RefCell::new(GOpts::default()),
+            ft_config: RefCell::new(HashMap::new()),
+            activated: Cell::new(false),
+            eff_curpos: Cell::new((1, 1)),
+            scroll_timer: Cell::new(None),
         }
     }
 
@@ -572,6 +602,7 @@ impl State {
     pub fn drop_buf(&self, bufnr: i32) {
         self.bufs.borrow_mut().remove(&bufnr);
         self.surround_memo.borrow_mut().remove(&bufnr);
+        self.ft_config.borrow_mut().remove(&bufnr);
         crate::treesitter::invalidate(self, Some(bufnr));
     }
 
@@ -587,6 +618,50 @@ impl State {
     /// `:NoMatchParen` / `:DoMatchParen` runtime toggle.
     pub fn set_matchparen_enabled(&self, on: bool) {
         self.gopts.borrow_mut().matchparen_enabled = on;
+    }
+
+    /// The derived filetype config for `buf` (default when none was applied).
+    pub fn ft_config(&self, buf: i32) -> FtConfig {
+        self.ft_config.borrow().get(&buf).cloned().unwrap_or_default()
+    }
+
+    pub fn set_ft_config(&self, buf: i32, cfg: FtConfig) {
+        self.ft_config.borrow_mut().insert(buf, cfg);
+    }
+
+    /// Per-buffer matchparen enable override (None = use the global toggle).
+    pub fn ft_matchparen_enabled(&self, buf: i32) -> Option<bool> {
+        self.ft_config.borrow().get(&buf).and_then(|c| c.matchparen_enabled)
+    }
+
+    /// Per-buffer highlight timeout override (None = use the global timeout).
+    pub fn ft_matchparen_timeout(&self, buf: i32) -> Option<i64> {
+        self.ft_config.borrow().get(&buf).and_then(|c| c.matchparen_timeout)
+    }
+
+    /// Effective position for raw `b:match_skip` evaluation.
+    pub fn eff_pos(&self) -> (i64, i64) {
+        self.eff_curpos.get()
+    }
+
+    pub fn set_eff_pos(&self, lnum: i64, cnum: i64) {
+        self.eff_curpos.set((lnum, cnum));
+    }
+
+    pub fn scroll_timer(&self) -> Option<i64> {
+        self.scroll_timer.get()
+    }
+
+    pub fn set_scroll_timer(&self, tid: Option<i64>) {
+        self.scroll_timer.set(tid);
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.activated.get()
+    }
+
+    pub fn set_activated(&self) {
+        self.activated.set(true);
     }
 
     /// Translate + compile with the shared cache.
@@ -838,27 +913,6 @@ fn push_class_char(out: &mut String, c: u32) {
     }
 }
 
-fn read_midmap(buf: &Buffer) -> Option<Vec<(String, String)>> {
-    use nvim_oxi::conversion::FromObject;
-    let arr = buf.get_var::<nvim_oxi::Array>("match_midmap").ok()?;
-    let mut out = Vec::new();
-    for item in arr {
-        if let Ok(pair) = nvim_oxi::Array::from_object(item.clone()) {
-            let mut it = pair.into_iter();
-            if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                if let (Ok(s), Ok(w)) = (String::from_object(a), String::from_object(b)) {
-                    out.push((s, w));
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
 fn hash_inputs(parts: &[&str]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for p in parts {
@@ -883,7 +937,14 @@ pub enum TsWords {
 pub fn ensure_buf(state: &State, buf: &Buffer, ts_words: TsWords) -> i32 {
     let h = buf.handle();
 
-    let match_words_raw = buf_var_string(buf, "match_words");
+    // Plugin config lives in Rust (State.ft_config); base b:match_words /
+    // b:match_skip set by nvim's runtime ftplugins or the user are the input
+    // fallback when the native ftplugin did not derive a value.
+    let ftc = state.ft_config(h);
+    let match_words_raw = ftc
+        .match_words
+        .clone()
+        .unwrap_or_else(|| buf_var_string(buf, "match_words"));
     let mut match_words = if !match_words_raw.is_empty() && !match_words_raw.contains(':') {
         // expression-valued: evaluate and use the global cache.
         // SECURITY NOTE: this mirrors vim-matchup's own behavior
@@ -921,13 +982,13 @@ pub fn ensure_buf(state: &State, buf: &Buffer, ts_words: TsWords) -> i32 {
 
     let matchpairs = buf_option(buf, "matchpairs");
     let iskeyword = buf_option(buf, "iskeyword");
-    let nomps = buf
-        .get_var::<i64>("matchup_delim_nomatchpairs")
-        .unwrap_or(0)
-        != 0;
+    let nomps = ftc.nomatchpairs;
     let ignorecase = buf.get_var::<i64>("match_ignorecase").unwrap_or(0) != 0;
-    let match_skip = buf_var_string(buf, "match_skip");
-    let midmap = read_midmap(buf);
+    let match_skip = ftc
+        .match_skip
+        .clone()
+        .unwrap_or_else(|| buf_var_string(buf, "match_skip"));
+    let midmap = ftc.midmap.clone();
 
     let midmap_key: String = midmap
         .as_ref()

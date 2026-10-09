@@ -119,6 +119,17 @@ else
 end
 
 local function precondition()
+  if engine == 'rs' then
+    -- config now lives in Rust (State.ft_config), not b: vars; read the
+    -- resolved config the engine actually uses.
+    local c = require('matchup_rs').buffer_config()
+    return {
+      match_words = c.match_words or '',
+      match_skip = c.match_skip or '',
+      matchpairs = c.matchpairs or '',
+      ignorecase = c.ignorecase or '',
+    }
+  end
   return {
     match_words = vim.b.match_words or '',
     match_skip = vim.b.match_skip or '',

@@ -153,21 +153,6 @@ pub fn setup(state: &SharedState) {
 }
 
 // ---------------------------------------------------------------------------
-// Option helpers
-// ---------------------------------------------------------------------------
-
-fn buf_or_gopt_i64(ctx: &Ctx, bname: &str, gval: i64) -> i64 {
-    ctx.buf.get_var::<i64>(bname).unwrap_or(gval)
-}
-
-fn buf_or_gopt_bool(ctx: &Ctx, bname: &str, gval: bool) -> bool {
-    ctx.buf
-        .get_var::<i64>(bname)
-        .map(|v| v != 0)
-        .unwrap_or(gval)
-}
-
-// ---------------------------------------------------------------------------
 // highlight
 // ---------------------------------------------------------------------------
 
@@ -196,12 +181,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     {
         tr("state(a)"); return;
     }
-    if ctx
-        .buf
-        .get_var::<i64>("matchup_matchparen_enabled")
-        .unwrap_or(1)
-        == 0
-    {
+    if ctx.state.ft_matchparen_enabled(ctx.buf.handle()) == Some(false) {
         tr("buf disabled"); return;
     }
 
@@ -270,13 +250,11 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
 
     let insertmode = real_mode == "i";
     let timeout = if insertmode {
-        buf_or_gopt_i64(
-            ctx,
-            "matchup_matchparen_insert_timeout",
-            g.matchparen_insert_timeout as i64,
-        ) as f64
+        g.matchparen_insert_timeout
     } else {
-        buf_or_gopt_i64(ctx, "matchup_matchparen_timeout", g.matchparen_timeout as i64) as f64
+        ctx.state
+            .ft_matchparen_timeout(ctx.buf.handle())
+            .unwrap_or(g.matchparen_timeout as i64) as f64
     };
     ctx.state.perf.timeout_start(timeout);
 
@@ -440,11 +418,7 @@ fn fade(ctx: &Ctx, level: i32, pos: Option<Pos>, token_save_pos: &mut Option<Pos
 
 /// Port of s:matchparen.highlight_deferred (matchparen.vim:293).
 pub fn highlight_deferred(ctx: &Ctx) {
-    let deferred = buf_or_gopt_bool(
-        ctx,
-        "matchup_matchparen_deferred",
-        ctx.gopts.matchparen_deferred,
-    );
+    let deferred = ctx.gopts.matchparen_deferred;
     if !deferred {
         highlight(ctx, false, false);
         return;
@@ -640,8 +614,6 @@ pub fn clear(ctx: &Ctx) {
             "if exists('#User#MatchupOffscreenLeave') | doautocmd <nomodeline> User MatchupOffscreenLeave | endif",
         );
     }
-    let mut win = ctx.win.clone();
-    let _ = win.set_var("matchup_statusline", "");
 }
 
 // ---------------------------------------------------------------------------
@@ -805,19 +777,61 @@ fn do_offscreen(ctx: &Ctx, ml: &MatchingList, current: &Delim, method: &str) {
     }
 }
 
+/// Create (once) the paused 50ms scroll-refresh timer; the id is held in Rust
+/// state (replaces vimscript `s:scroll_timer`).
+fn ensure_scroll_timer(state: &State) -> bool {
+    if state.scroll_timer().is_some() {
+        return true;
+    }
+    let opts = Dictionary::from_iter([("repeat", Object::from(-1i64))]);
+    let args = Array::from_iter([
+        Object::from(50i64),
+        Object::from("matchup#rs#scroll_callback"),
+        Object::from(opts),
+    ]);
+    match nvimrs::call_fn_as::<i64>("timer_start", &args) {
+        Some(tid) => {
+            let p = Array::from_iter([Object::from(tid), Object::from(1i64)]);
+            let _ = nvimrs::call_fn_as::<i64>("timer_pause", &p);
+            state.set_scroll_timer(Some(tid));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Timer callback (via the `matchup#rs#scroll_callback` shim): pause and
+/// re-highlight now that the offscreen line has scrolled into view.
+pub fn scroll_callback(state: &SharedState, tid: i64) {
+    let p = Array::from_iter([Object::from(tid), Object::from(1i64)]);
+    let _ = nvimrs::call_fn_as::<i64>("timer_pause", &p);
+    crate::with_ctx(state, |ctx| highlight(ctx, true, false));
+}
+
+/// Statusline `%{matchup#rs#scroll_update(N)}` hook: unpause the timer when the
+/// offscreen line scrolls into view. Returns '' (the statusline value).
+pub fn scroll_update(state: &State, lnum: i64) -> String {
+    if let Some(tid) = state.scroll_timer() {
+        let w0: i64 =
+            nvimrs::call_fn_as("line", &Array::from_iter([Object::from("w0")])).unwrap_or(0);
+        let wd: i64 =
+            nvimrs::call_fn_as("line", &Array::from_iter([Object::from("w$")])).unwrap_or(0);
+        if w0 <= lnum && lnum <= wd {
+            let p = Array::from_iter([Object::from(tid), Object::from(0i64)]);
+            let _ = nvimrs::call_fn_as::<i64>("timer_pause", &p);
+        }
+    }
+    String::new()
+}
+
 fn do_offscreen_statusline(ctx: &Ctx, ml: &MatchingList, offscreen: &Delim, manual: bool) {
     let (mut sl, lnum) = status_str(ctx, ml, offscreen, manual);
     // scroll refresh: re-highlight once the offscreen line scrolls into
-    // view (matchparen.vim:574-576)
+    // view (matchparen.vim:574-576). The timer id lives in Rust state.
     if !manual {
-        let timer_ok: i64 = nvimrs::call_fn0_as("matchup#rs#ensure_scroll_timer").unwrap_or(0);
-        if timer_ok != 0 {
+        if ensure_scroll_timer(ctx.state) {
             sl.push_str(&format!("%{{matchup#rs#scroll_update({lnum})}}"));
         }
-    }
-    {
-        let mut win = ctx.win.clone();
-        let _ = win.set_var("matchup_statusline", sl.clone());
     }
     if !manual {
         let win_h = ctx.win.handle();

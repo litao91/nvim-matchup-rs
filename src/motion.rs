@@ -746,16 +746,16 @@ pub fn op_motion(ctx: &Ctx, plug: &str) {
 
     let wise = if force.is_empty() { "v" } else { force.as_str() };
     let count: i64 = crate::nvimrs::get_vvar_as("count").unwrap_or(0);
-    let _ = api::set_var(
-        "mrs_op_args",
-        nvim_oxi::Array::from_iter([
-            nvim_oxi::Object::from(wise),
-            nvim_oxi::Object::from(count),
-            nvim_oxi::Object::from(plug),
+    ctx.state.in_op.set(true);
+    // args passed directly to the shim (no g: global state)
+    let _ = crate::nvimrs::call_fn_as::<i64>(
+        "matchup#rs#op_exec",
+        &Array::from_iter([
+            Object::from(wise),
+            Object::from(count),
+            Object::from(plug),
         ]),
     );
-    ctx.state.in_op.set(true);
-    let _ = crate::nvimrs::call_fn0_as::<i64>("matchup#rs#op_exec");
     ctx.state.in_op.set(false);
     *ctx.state.op_operator.borrow_mut() = String::new();
 }

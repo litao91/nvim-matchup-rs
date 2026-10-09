@@ -40,10 +40,15 @@ Both of vim-matchup's matching engines are implemented natively in Rust:
 ## Build
 
 Requires Rust (stable) and Neovim >= 0.11. The build was developed against
-Neovim 0.13.0-dev; note that this nvim version changed some C API signatures
-(`nvim_call_function`, `nvim_echo`) and does not fire Lua-ref autocmd/keymap
-callbacks, so the plugin drives those paths through `eval`/command strings and
-vimscript shims in `autoload/matchup/rs.vim`.
+Neovim 0.13.0-dev, whose C ABI drifted from what nvim-oxi 0.6 assumes:
+`nvim_call_function` gained a leading channel id, `nvim_echo`'s return type
+changed, and the `nvim_create_autocmd` keyset layout shifted so oxi's Lua-ref
+callbacks register but never fire. `src/nvimrs.rs` re-declares those functions
+with their true 0.13 signatures, so the plugin uses direct native calls and
+real Rust autocmd callbacks throughout - it never routes through `api::eval`. A
+native `nvim_eval` wrapper remains only for the three genuinely-arbitrary
+vimscript expressions (expression-valued `b:match_words`, raw `b:match_skip`,
+and the linewise-operator config); everything else is a typed native call.
 
 Build the native module from inside nvim with the Lua helper:
 
@@ -118,12 +123,18 @@ lives entirely in the `setup` table. Option names mirror vim-matchup's
 `g:matchup_<group>_<name>`, nested and de-prefixed (e.g.
 `g:matchup_treesitter_disable_virtual_text` -> `treesitter.disable_virtual_text`).
 
-Per-filetype delimiter definitions (`b:match_words`, `b:match_skip`,
-`b:match_midmap`, ...) are built into the Rust module (`src/ftplugin.rs`, a port
-of vim-matchup's `after/ftplugin/*.vim`) and applied from a `FileType` autocmd,
-so no vimscript ftplugin files are shipped. Buffer-local `b:*` variables remain
-the per-buffer configuration surface (they are set by the native ftplugin
-definitions and may be overridden by users/ftplugins as in vim-matchup).
+Per-filetype delimiter definitions (`match_words`, `match_skip`, `midmap`, ...)
+are built into the Rust module (`src/ftplugin.rs`, a port of vim-matchup's
+`after/ftplugin/*.vim`) and applied from a `FileType` autocmd, so no vimscript
+ftplugin files are shipped. **All plugin config and runtime state lives in
+Rust** (`State.ft_config` and the `State` cells) - the plugin never writes `b:`/
+`g:`/`w:` config variables. It only *reads* nvim's own runtime/matchit inputs
+(base `b:match_words`, `b:match_ignorecase`, `&matchpairs`) as a fallback for
+filetypes without a native definition, so a user-set `b:match_words` is still
+honored. There is no vim-matchup compatibility layer (`matchup#util#*`,
+`MatchupStatusOffscreen()`, the `g:loaded_matchup` claim are all gone); the only
+globals it sets belong to *other* plugins (`g:loaded_matchit`,
+`g:loaded_matchparen`, `g:vimtex_matchparen_enabled`) and are set from Rust.
 
 ## Performance
 
@@ -178,10 +189,12 @@ class builder, skip compilation and position helpers.
 
 The native filetype definitions (`src/ftplugin.rs`) are verified byte-for-byte
 against vim-matchup's `after/ftplugin/*.vim`: a headless harness sets each of
-the 16 supported filetypes under both plugins and diffs the resulting
-`b:match_words`/`b:match_skip`/`b:match_midmap`/`&matchpairs`, both with default
-prefs and with the `matchpref` branches (`nolists`/`tagnameonly`/`template`/
-`relax_env`) enabled - all 16 match exactly in both modes.
+the 16 supported filetypes under both plugins and diffs the resulting config -
+read from Rust via the `buffer_config()` introspection export on the Rust side
+and from `b:match_words`/`b:match_skip`/`b:match_midmap`/`&matchpairs` on the
+original - both with default prefs and with the `matchpref` branches
+(`nolists`/`tagnameonly`/`template`/`relax_env`) enabled. All 16 match exactly
+in both modes.
 
 ## Layout
 
@@ -190,23 +203,33 @@ src/
   vimregex.rs    vim-magic -> fancy-regex translator (obligations, scan mode,
                  first-byte/literal-prefix analysis)
   words.rs       b:match_words/&matchpairs parser (loader.vim port)
-  state.rs       per-buffer compiled state, caches, setup(opts) config, perf
+  state.rs       per-buffer compiled state, caches, setup(opts) config, the
+                 Rust FtConfig store + all runtime state cells, perf
   skip.rs        b:match_skip evaluation
   engine.rs      get_delim / get_matching / get_surrounding / jump_target
   treesitter.rs  pure-Rust treesitter engine
-  ftplugin.rs    native per-filetype definitions (after/ftplugin port), FileType autocmd
-  matchparen.rs  highlighting, offscreen status, deferred debounce
+  ftplugin.rs    native per-filetype definitions (after/ftplugin port); builds
+                 FtConfig from a FileType autocmd (no b: vars written)
+  matchparen.rs  highlighting, offscreen status, deferred + scroll timers
   motion.rs      %, g%, [%, ]%, z% + operator-pending machinery
   textobj.rs     i%, a%
-  lib.rs         Lua module surface (setup, raw engine API, autocmd/keymap wiring)
+  nvimrs.rs      native nvim C-API FFI (0.13-dev ABI) - call_function, autocmd
+                 callbacks, options/vars, echo; replaces the ABI-broken oxi paths
+  lib.rs         Lua module surface (setup, activation, raw engine API,
+                 autocmd/keymap wiring)
 lua/matchup_rs/build.lua     Lua build helper: require('matchup_rs.build').build()
-plugin/matchup_rs.lua        load guard only (plugin is inert until setup)
-autoload/matchup/rs.vim      activation (hl groups/commands/matchit), timers, skip eval, op re-feed
-autoload/matchup/util.vim    compat helpers for user ftplugins (matchpref bridges to Rust)
+autoload/matchup/rs.vim      stateless vimscript shims only: timers, raw skip
+                             eval, effective-position accessors, op re-feed,
+                             indentexpr trick (no plugin state)
 after/queries/               treesitter queries, copied from vim-matchup (MIT)
 tests/diff/                  cross-engine correctness harness
 bench/                       benchmark harness + results
 ```
+
+The plugin is a pure Lua module: adding it to `runtimepath` does nothing until
+you call `require('matchup_rs').setup{...}` (there is no `plugin/` script). All
+mutable state - config, timers, activation, effective cursor, offscreen
+statusline - is held in the Rust `State`; vimscript/lua hold none.
 
 ## Security notes
 
