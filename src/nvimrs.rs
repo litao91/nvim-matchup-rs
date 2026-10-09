@@ -375,6 +375,16 @@ unsafe extern "C" {
         err: *mut CError,
     );
     fn nvim_get_option_value(name: CStr, opts: *const KeyDictOption, err: *mut CError) -> Object;
+    // 0.13 sig: (channel_id, name, value, opts, arena, err) -> Object. oxi 0.6
+    // declares this against v0.10 (no `arena`, `void` return) -> ABI-broken here.
+    fn nvim_set_option_value(
+        channel_id: u64,
+        name: CStr,
+        value: Object,
+        opts: *const KeyDictOption,
+        arena: *mut c_void,
+        err: *mut CError,
+    ) -> Object;
     fn nvim_get_var(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_get_vvar(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_buf_get_var(buf: i32, name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
@@ -528,6 +538,40 @@ pub fn get_option_as<V: FromObject>(name: &str, buf: i32, win: i32) -> Option<V>
 pub fn get_option_local_as<V: FromObject>(name: &str, win: i32) -> Option<V> {
     let obj = get_option_scoped(name, "local", 0, win)?;
     V::from_object(obj).ok()
+}
+
+/// Native window-local option set - the equivalent of
+/// `setwinvar(win, '&{name}', value)` (`nvim_set_option_value` with `{win}`).
+/// Hand-rolled because oxi 0.6's binding targets nvim v0.10 (missing the `arena`
+/// param and the `Object` return) and is ABI-broken on 0.13.
+pub fn set_option_local(name: &str, win: i32, value: &str) -> bool {
+    let (_ng, cname) = match cstr(name) {
+        Some(x) => x,
+        None => return false,
+    };
+    let vobj = Object::from(value.to_string());
+    // nvim copies `value` synchronously and does not adopt it, so ownership stays
+    // with `vobj` (freed once at end of scope) and C gets a bitwise copy. The
+    // copy moved into the `extern "C"` call is forgotten (such args are not
+    // dropped), so the string is freed exactly once - no leak, no double-free.
+    let vcopy = unsafe { ptr::read(&vobj) };
+    // SAFETY: all-zero `KeyDictOption` is valid (is_set = 0); `win` is set with
+    // its is_set bit. Rest per the module contract.
+    let mut opts: KeyDictOption = unsafe { std::mem::zeroed() };
+    if win != 0 {
+        opts.win = win;
+        opts.is_set |= 1 << OPTIDX_OPTION_WIN;
+    }
+    let mut err = CError::new();
+    // SAFETY: `cname` is backed by `_ng` (outlives the call), `opts`/`err` are
+    // valid pointers, arena is null so any nvim allocation uses xmalloc (the
+    // returned `Object` owns and frees it), `vcopy` ownership is as above, and
+    // LUA_INTERNAL_CALL is the internal channel id.
+    let ret = unsafe {
+        nvim_set_option_value(LUA_INTERNAL_CALL, cname, vcopy, &opts, ptr::null_mut(), &mut err)
+    };
+    drop(ret);
+    !err.is_err()
 }
 
 /// Native `nvim_get_var` (g: scope).

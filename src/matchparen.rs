@@ -63,6 +63,31 @@ fn trace_write(msg: &str) {
     }
 }
 
+thread_local! {
+    /// Set once `has('vim_starting')` has been observed false. Startup never
+    /// resumes, so false is terminal and safe to cache.
+    static VIM_STARTING_DONE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// `has('vim_starting')`, memoized: it is true only during startup and flips to
+/// false exactly once, so after the first false the hot highlight path skips the
+/// vimscript round-trip. (`state('a')` beside it stays live - it is dynamic.)
+fn vim_starting() -> bool {
+    VIM_STARTING_DONE.with(|done| {
+        if done.get() {
+            return false;
+        }
+        let starting =
+            nvimrs::call_fn_as::<i64>("has", &Array::from_iter([Object::from("vim_starting")]))
+                .unwrap_or(0)
+                != 0;
+        if !starting {
+            done.set(true);
+        }
+        starting
+    })
+}
+
 /// Namespace id, created lazily so highlighting works even if setup()
 /// has not run (create_namespace is idempotent by name).
 fn ns_id(state: &State) -> u32 {
@@ -207,10 +232,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         tr("disabled");
         return;
     }
-    if crate::nvimrs::call_fn_as::<i64>("has", &Array::from_iter([Object::from("vim_starting")]))
-        .unwrap_or(0)
-        != 0
-    {
+    if vim_starting() {
         tr("vim_starting");
         return;
     }
@@ -365,8 +387,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     let method = g.matchparen_offscreen_method.clone();
     if !method.is_empty() && method != "none" && !current.skip {
         let scrolling = offscreen_scrolling_disabled(ctx);
-        let win_height: i64 =
-            nvimrs::call_fn_as("winheight", &Array::from_iter([Object::from(0i64)])).unwrap_or(0);
+        let win_height: i64 = ctx.win.get_height().unwrap_or(0) as i64;
         if !scrolling && win_height > 0 {
             do_offscreen(ctx, &ml, &current, &method);
         }
@@ -396,8 +417,7 @@ fn offscreen_scrolling_disabled(ctx: &Ctx) -> bool {
     let line = |expr: &str| -> i64 {
         nvimrs::call_fn_as("line", &Array::from_iter([Object::from(expr)])).unwrap_or(0)
     };
-    let wh: i64 =
-        nvimrs::call_fn_as("winheight", &Array::from_iter([Object::from(0i64)])).unwrap_or(0);
+    let wh: i64 = ctx.win.get_height().unwrap_or(0) as i64;
     let scrolloff: i64 = nvimrs::get_option_as("scrolloff", 0, ctx.win.handle()).unwrap_or(0);
     let cur = ctx.cursor().map(|p| p.lnum as i64).unwrap_or(0);
     let wdollar = line("w$");
@@ -491,8 +511,8 @@ pub fn highlight_deferred(ctx: &Ctx) {
     let mut mp = ctx.state.matchparen.borrow_mut();
     let ws = mp.wins.entry(win_h).or_default();
     if ws.timer_id.is_none() {
-        let vim_winid: i64 = nvimrs::call_fn0_as("win_getid").unwrap_or(0);
-        ws.vim_winid = vim_winid;
+        // win_getid() is the current window's handle, which is ctx.win here.
+        ws.vim_winid = win_h as i64;
         match timer_start(show_delay, "matchup#rs#timer_cb") {
             Ok(tid) => {
                 ws.timer_id = Some(tid);
@@ -541,7 +561,7 @@ pub fn timer_callback(state: &SharedState, tid: i64) {
         Some(o) => o,
         None => return,
     };
-    let cur_winid: i64 = nvimrs::call_fn0_as("win_getid").unwrap_or(-1);
+    let cur_winid: i64 = api::get_current_win().handle() as i64;
     if cur_winid != vim_winid {
         timer_pause(tid, true);
         if let Some(ws) = state.matchparen.borrow_mut().wins.get_mut(&win_h) {
@@ -610,7 +630,7 @@ pub fn fade_timer_callback(state: &SharedState, tid: i64) {
         Some(o) => o,
         None => return,
     };
-    let cur_winid: i64 = nvimrs::call_fn0_as("win_getid").unwrap_or(-1);
+    let cur_winid: i64 = api::get_current_win().handle() as i64;
     if cur_winid != vim_winid {
         timer_pause(tid, true);
         return;
@@ -660,15 +680,7 @@ pub fn clear(ctx: &Ctx) {
         ws.old_statusline.take()
     };
     if let Some(old) = old {
-        let vim_winid: i64 = nvimrs::call_fn0_as("win_getid").unwrap_or(0);
-        let _ = nvimrs::call_function(
-            "setwinvar",
-            &Array::from_iter([
-                Object::from(vim_winid),
-                Object::from("&statusline"),
-                Object::from(old.as_str()),
-            ]),
-        );
+        nvimrs::set_option_local("statusline", win_h, &old);
         nvimrs::exec_user_autocmd("MatchupOffscreenLeave");
     }
 }
@@ -903,15 +915,7 @@ fn do_offscreen_statusline(ctx: &Ctx, ml: &MatchingList, offscreen: &Delim, manu
                 ws.statusline_set = true;
             }
         }
-        let vim_winid: i64 = nvimrs::call_fn0_as("win_getid").unwrap_or(0);
-        let _ = nvimrs::call_function(
-            "setwinvar",
-            &Array::from_iter([
-                Object::from(vim_winid),
-                Object::from("&statusline"),
-                Object::from(sl.as_str()),
-            ]),
-        );
+        nvimrs::set_option_local("statusline", win_h, sl.as_str());
         nvimrs::exec_user_autocmd("MatchupOffscreenEnter");
     }
 }
@@ -1088,8 +1092,7 @@ pub fn status_str(
         out.extend_from_slice(format_gutter(ctx, lnum, false).as_bytes());
     }
 
-    let ww: i64 =
-        nvimrs::call_fn_as("winwidth", &Array::from_iter([Object::from(0i64)])).unwrap_or(80);
+    let ww: i64 = ctx.win.get_width().unwrap_or(80) as i64;
     let wincol: i64 = nvimrs::call_fn0_as("wincol").unwrap_or(1);
     let virtcol: i64 =
         nvimrs::call_fn_as("virtcol", &Array::from_iter([Object::from(".")])).unwrap_or(1);
