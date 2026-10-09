@@ -156,6 +156,9 @@ pub struct GOpts {
     pub motion_enabled: bool,
     pub text_obj_enabled: bool,
     pub matchparen_offscreen_scrolloff: i64,
+    /// Disable matchup entirely for buffers with more than this many lines
+    /// (0 = no limit). A guard against pathological cost on very large files.
+    pub max_lines: usize,
     /// `g:matchup_matchpref` equivalent: filetype -> pref id -> bool.
     pub matchpref: HashMap<String, HashMap<String, bool>>,
 }
@@ -197,6 +200,7 @@ impl Default for GOpts {
             mappings_enabled: true,
             motion_enabled: true,
             text_obj_enabled: true,
+            max_lines: 0,
             matchpref: HashMap::new(),
         }
     }
@@ -261,6 +265,10 @@ impl GOpts {
 
         if let Some(v) = opts.get("mappings").and_then(obj_bool) {
             g.mappings_enabled = v;
+        }
+
+        if let Some(v) = opts.get("max_lines").and_then(obj_i64) {
+            g.max_lines = v.max(0) as usize;
         }
 
         if let Some(mp) = sub(opts, "matchpref") {

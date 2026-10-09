@@ -91,6 +91,8 @@ available; nothing is mapped, highlighted or configured until you call:
 require('matchup_rs').setup({
   -- every key is optional; omitted keys use these defaults
   mappings = true,                       -- master switch for all keymaps
+  max_lines = 0,                         -- disable matchup for buffers with
+                                         -- more than this many lines (0 = off)
   matchpref = {},                        -- e.g. { html = { nolists = true } }
   delim = {
     noskips = 0, nomids = false, stopline = 1500, count_fail = false, count_max = 8,

@@ -133,6 +133,11 @@ pub(crate) fn with_ctx_for<R>(
     f: impl FnOnce(&Ctx) -> R,
 ) -> Option<R> {
     let gopts = state.gopts();
+    // Large-file guard: skip matchup entirely for oversized buffers (all ops
+    // then no-op). Checked before ensure_buf so we don't even compile patterns.
+    if gopts.max_lines > 0 && buf.line_count().unwrap_or(0) > gopts.max_lines {
+        return None;
+    }
     let ts_words = if gopts.ts_enabled {
         match crate::treesitter::active_lang(state, &gopts, buf.handle()) {
             Some(_) if gopts.ts_include_match_words => state::TsWords::Filter,
