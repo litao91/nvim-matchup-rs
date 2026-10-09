@@ -1,6 +1,7 @@
 -- Build the native module and deploy it where require('matchup_rs') finds it.
 --
---   :lua require('matchup_rs.build').build()
+--   :lua require('matchup_rs.build').ensure()                 -- build only if outdated
+--   :lua require('matchup_rs.build').build()                  -- always (re)build
 --   :lua require('matchup_rs.build').build({ profile = 'debug' })
 --   :lua require('matchup_rs.build').build({ touch = true })  -- WSL2/drvfs mtime
 --   :lua require('matchup_rs.build').build_log()              -- open the build log
@@ -86,31 +87,75 @@ local function copy_over(u, src, dest)
   return true
 end
 
--- Deploy the built cdylib to lua/matchup_rs.{so,dll} (platform-specific).
+-- Where require('matchup_rs') loads the native module from (the deploy target).
+local function dest_path(root)
+  local s = sep()
+  return root .. s .. 'lua' .. s .. (is_windows() and 'matchup_rs.dll' or 'matchup_rs.so')
+end
+
+-- cargo's output for the cdylib, per platform/profile.
+local function artifact_path(root, release)
+  local s = sep()
+  local target = root .. s .. 'target' .. s .. (release and 'release' or 'debug')
+  if is_windows() then
+    return target .. s .. 'matchup_rs.dll'
+  elseif is_mac() then
+    return target .. s .. 'libmatchup_rs.dylib'
+  end
+  return target .. s .. 'libmatchup_rs.so'
+end
+
+-- Deploy the built cdylib to lua/matchup_rs.{so,dll}.
 local function deploy(u, root, release)
   local s = sep()
-  local prof_dir = release and 'release' or 'debug'
-  local target = root .. s .. 'target' .. s .. prof_dir
-  local artifact, dest
-  if is_windows() then
-    artifact = target .. s .. 'matchup_rs.dll'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.dll'
-  elseif is_mac() then
-    artifact = target .. s .. 'libmatchup_rs.dylib'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
-  else
-    artifact = target .. s .. 'libmatchup_rs.so'
-    dest = root .. s .. 'lua' .. s .. 'matchup_rs.so'
-  end
   local luadir = root .. s .. 'lua'
   if not u.fs_stat(luadir) then
     u.fs_mkdir(luadir, 493) -- 0755
   end
+  local artifact = artifact_path(root, release)
+  local dest = dest_path(root)
   local ok, err = copy_over(u, artifact, dest)
   if not ok then
     return nil, err
   end
   return dest
+end
+
+local function mtime(u, path)
+  local st = u.fs_stat(path)
+  if not st then
+    return nil
+  end
+  return st.mtime.sec + st.mtime.nsec * 1e-9
+end
+
+-- Source inputs whose change should force a rebuild.
+local function source_files(root)
+  local s = sep()
+  local files = vim.fn.glob(root .. s .. 'src' .. s .. '**' .. s .. '*.rs', false, true)
+  for _, extra in ipairs({ 'Cargo.toml', 'Cargo.lock', 'build.rs' }) do
+    local p = root .. s .. extra
+    if vim.uv.fs_stat(p) then
+      files[#files + 1] = p
+    end
+  end
+  return files
+end
+
+-- True when the deployed native module is missing or older than any source
+-- input (i.e. the binary is outdated and should be rebuilt).
+local function is_outdated(u, root, release)
+  local so_mtime = mtime(u, dest_path(root))
+  if not so_mtime then
+    return true -- not built yet
+  end
+  for _, f in ipairs(source_files(root)) do
+    local m = mtime(u, f)
+    if m and m > so_mtime then
+      return true
+    end
+  end
+  return false
 end
 
 --- Build the native module from source (asynchronous).
@@ -179,6 +224,25 @@ function M.build(opts)
     end
     notify(vim.log.levels.INFO, 'Successfully built native module (restart nvim to load it).')
   end))
+end
+
+--- Ensure the native module is present and up to date: rebuild (async) when the
+--- deployed binary is missing or older than any source input, then report
+--- whether it can be loaded *now*. A rebuild takes effect on the next start
+--- (a running nvim keeps the currently loaded module), so when this returns
+--- false the caller should skip setup and let the user restart once the build
+--- notification arrives.
+--- @param opts? { dir?: string, profile?: 'release'|'debug', touch?: boolean }
+--- @return boolean loadable true if require('matchup_rs') succeeds this session
+function M.ensure(opts)
+  opts = opts or {}
+  local u = uv()
+  local root = repo_root(opts)
+  local release = (opts.profile or 'release') == 'release'
+  if is_outdated(u, root, release) then
+    M.build(opts)
+  end
+  return pcall(require, 'matchup_rs')
 end
 
 --- Open the captured build log.
