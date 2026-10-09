@@ -164,8 +164,7 @@ impl<'a> Ctx<'a> {
         let margin = gopts.delim_stopline.max(gopts.matchparen_stopline) + 100;
         let lines = snapshot_for(state, &buf, &win, margin);
         let mode: String =
-            crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-                .unwrap_or_else(|| "n".to_string());
+            crate::nvimrs::get_mode_full().unwrap_or_else(|| "n".to_string());
         let synmaxcol: i64 =
             crate::nvimrs::get_option_as("synmaxcol", buf.handle(), 0).unwrap_or(0);
         let syntax_on: i64 = if crate::nvimrs::get_var_as::<Object>("syntax_on").is_some() {

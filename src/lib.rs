@@ -161,8 +161,7 @@ pub(crate) fn run_motion(state: &SharedState, name: &str, f: impl Fn(&Ctx) -> bo
         with_ctx(state, |ctx| {
             let moved = f(ctx);
             if !moved {
-                let m: String = nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-                    .unwrap_or_default();
+                let m: String = nvimrs::get_mode_full().unwrap_or_default();
                 if m.starts_with("no") {
                     let k = nvim_oxi::String::from("\x1b");
                     let md = nvim_oxi::String::from("n");

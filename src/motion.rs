@@ -50,8 +50,7 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
 
 /// Port of matchup#motion_force (matchup.vim:167).
 fn motion_force() -> String {
-    let mode: String = crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-        .unwrap_or_default();
+    let mode: String = crate::nvimrs::get_mode_full().unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
@@ -102,7 +101,7 @@ fn read_vars(ctx: &Ctx) -> Vars {
 /// Ensure visual mode is active for a visual mapping callback (the
 /// original re-enters with `normal! gv` after `:<c-u>`).
 fn ensure_visual() {
-    let m: String = crate::nvimrs::call_fn0_as("mode").unwrap_or_default();
+    let m: String = crate::nvimrs::get_mode().unwrap_or_default();
     if !m.starts_with('v') && !m.starts_with('V') && !m.contains('\x16') && !m.starts_with("^V") {
         normal("gv");
     }

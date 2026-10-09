@@ -440,6 +440,34 @@ pub fn call_fn0_as<V: FromObject>(name: &str) -> Option<V> {
     call_fn_as(name, &Array::new())
 }
 
+/// Native `nvim_get_mode().mode` - byte-identical to vimscript `mode(1)` on
+/// nvim 0.13 (verified for n / i / v / V / ^V / no / nov / noV / no^V / c /
+/// niI / niV). Unlike `call_function`, oxi's `get_mode` binding is ABI-correct
+/// here (`nvim_get_mode(Arena*) -> Dict`, no channel-id, unchanged
+/// `{mode, blocking}` layout), so it needs no hand-rolled keyset - this just
+/// drops the vimscript-dispatch round-trip. `ModeStr` is a transparent newtype
+/// over `String`, so `to_string()` preserves the exact mode bytes.
+pub fn get_mode_full() -> Option<String> {
+    let gm = nvim_oxi::api::get_mode().ok()?;
+    Some(gm.mode.to_string())
+}
+
+/// vimscript `mode()` (the abbreviated form) via native `nvim_get_mode`.
+/// `mode()` equals `mode(1)` except it drops the operator-pending force-motion
+/// suffix (`nov`/`noV`/`no^V` -> `no`) and the CTRL-O restart-edit suffix
+/// (`niI`/`niR`/`niV` -> `n`); every other mode string is identical. Use this
+/// where the original called `mode()` with no argument.
+pub fn get_mode() -> Option<String> {
+    let m = get_mode_full()?;
+    Some(if m.starts_with("no") {
+        "no".to_string()
+    } else if m.starts_with("ni") {
+        "n".to_string()
+    } else {
+        m
+    })
+}
+
 /// Native `nvim_echo` with a single plain-text chunk (history=true).
 pub fn echo(text: &str) {
     let chunks = Array::from_iter([Object::from(Array::from_iter([Object::from(text)]))]);

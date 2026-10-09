@@ -233,7 +233,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     let real_mode: String = if changing_insert {
         crate::nvimrs::get_vvar_as("insertmode").unwrap_or_else(|| "i".to_string())
     } else {
-        crate::nvimrs::call_fn0_as("mode").unwrap_or_else(|| "n".to_string())
+        crate::nvimrs::get_mode().unwrap_or_else(|| "n".to_string())
     };
 
     let cursor = match ctx.cursor() {
@@ -284,7 +284,7 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
             .cloned()
             .and_then(|o| i64::try_from(o).ok())
             .unwrap_or(0);
-        let m: String = crate::nvimrs::call_fn0_as("mode").unwrap_or_default();
+        let m: String = crate::nvimrs::get_mode().unwrap_or_default();
         if off == 2147483647 && (m == "v" || m == "\x16") {
             tr("visual-block-eol");
             return;
@@ -399,9 +399,11 @@ fn offscreen_scrolling_disabled(ctx: &Ctx) -> bool {
     let wh: i64 =
         nvimrs::call_fn_as("winheight", &Array::from_iter([Object::from(0i64)])).unwrap_or(0);
     let scrolloff: i64 = nvimrs::get_option_as("scrolloff", 0, ctx.win.handle()).unwrap_or(0);
-    let cur = line(".");
+    let cur = ctx.cursor().map(|p| p.lnum as i64).unwrap_or(0);
     let wdollar = line("w$");
-    let last = line("$");
+    // line("$") is the buffer line count, already held in the snapshot
+    // (Lines::total == nvim_buf_line_count), so read it with zero FFI.
+    let last = ctx.lines.total as i64;
     let w0 = line("w0");
     wh > 2 * scrolloff && ((cur == wdollar - scrolloff && last != wdollar) || cur == w0 + scrolloff)
 }
@@ -977,13 +979,20 @@ fn isclike(buf: i32) -> bool {
 /// Port of s:format_gutter (matchparen.vim:1016).
 fn format_gutter(ctx: &Ctx, lnum: usize, noshowdir: bool) -> String {
     let win = ctx.win.handle();
+    // 'number'/'relativenumber' are *boolean* options: nvim returns a Boolean
+    // Object, so they must be read as bool. Reading them as i64 fails the
+    // FromObject conversion and silently yields 0/false, which would drop the
+    // gutter's line-number column. 'numberwidth' is a genuine integer option.
     let opt_i = |name: &str| -> i64 { nvimrs::get_option_as(name, 0, win).unwrap_or(0) };
+    let opt_b = |name: &str| -> bool {
+        nvimrs::get_option_as::<bool>(name, 0, win).unwrap_or(false)
+    };
     let wincol: i64 = nvimrs::call_fn0_as("wincol").unwrap_or(1);
     let virtcol: i64 =
         nvimrs::call_fn_as("virtcol", &Array::from_iter([Object::from(".")])).unwrap_or(1);
     let mut padding = wincol - virtcol;
-    let number = opt_i("number") != 0;
-    let relativenumber = opt_i("relativenumber") != 0;
+    let number = opt_b("number");
+    let relativenumber = opt_b("relativenumber");
     let numberwidth = opt_i("numberwidth");
     // strlen() is a byte count; String::len() matches.
     let lastlinelen: i64 =
@@ -997,8 +1006,9 @@ fn format_gutter(ctx: &Ctx, lnum: usize, noshowdir: bool) -> String {
     let foldlevel: i64 =
         nvimrs::call_fn_as("foldlevel", &Array::from_iter([Object::from(lnum as i64)]))
             .unwrap_or(0);
-    let curline: usize = nvimrs::call_fn_as::<i64>("line", &Array::from_iter([Object::from(".")]))
-        .unwrap_or(0) as usize;
+    // line('.') is just the cursor row; read it natively via ctx.cursor()
+    // (nvim_win_get_cursor) instead of a vimscript line('.') round-trip.
+    let curline: usize = ctx.cursor().map(|p| p.lnum).unwrap_or(0);
 
     let mut sl = String::new();
     let direction = lnum < curline;

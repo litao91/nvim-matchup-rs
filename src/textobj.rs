@@ -33,8 +33,7 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
 }
 
 fn motion_force() -> String {
-    let mode: String = crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-        .unwrap_or_default();
+    let mode: String = crate::nvimrs::get_mode_full().unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
