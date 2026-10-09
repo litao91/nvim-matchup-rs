@@ -89,16 +89,31 @@ fn patch(f: &mut Ft, from: &str, to: &str) {
 }
 
 /// True when the runtime base `b:match_words` sha256 begins with `prefix`
-/// (port of matchup#util#check_match_words). Uses Vim's sha256() so the digest
-/// guards tracking the runtime ftplugin's exact b:match_words stay valid.
+/// (port of matchup#util#check_match_words). The digest is computed natively
+/// (byte-identical to Vim's `sha256()`), so the guards tracking the runtime
+/// ftplugin's exact `b:match_words` stay valid.
 fn check(buf: &Buffer, prefix: &str) -> bool {
     let m = match buf_str(buf, "match_words") {
         Some(m) => m,
         None => return false,
     };
-    let hash: String = crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(m)]))
-        .unwrap_or_default();
-    hash.starts_with(prefix)
+    sha256_hex(&m).starts_with(prefix)
+}
+
+/// Lowercase-hex SHA-256 of `s`'s UTF-8 bytes - byte-identical to Vim's
+/// `sha256()` (verified against it), so the hardcoded `check` prefixes still
+/// match. Native to avoid an `nvim_call_function("sha256")` round-trip per
+/// ftplugin load.
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let d = sha2::Sha256::digest(s.as_bytes());
+    let mut out = String::with_capacity(64);
+    for b in d {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
 }
 
 /// Per-filetype pref from setup(opts) (port of matchup#util#matchpref).
@@ -485,4 +500,25 @@ pub fn setup(state: &SharedState) {
     );
     // Apply to the current buffer too (its FileType may have fired pre-setup).
     apply_current(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        // Standard SHA-256 vectors. Vim's sha256() is byte-identical to these
+        // (verified against the real runtime b:match_words), so a correct native
+        // digest keeps the hardcoded `check` prefixes matching.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha256_hex("abc").len(), 64);
+    }
 }
