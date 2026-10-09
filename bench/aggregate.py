@@ -85,7 +85,13 @@ def main():
                '(full-file depth scan)')
     out.append('  - `surrounding_deep`: get_surrounding from the target '
                'line inside the outermost block (walks back past every '
-               'sibling block)')
+               'sibling block). On the 50k synthetic fixtures the outer '
+               'block sits beyond the search bound (`delim_stopline`), so '
+               'both engines return not-found there (verified to agree: '
+               'rust nil, orig empty) - the large ratios reflect the '
+               'bounded backward-walk speed, not a found-pair speedup. The '
+               'real 50k vimscript file stays within the bound, so both '
+               'sides do the full walk there')
     out.append('  - `highlight`: full matchparen cycle incl. extmark writes '
                '(cursor alternates between two positions per iteration)')
     out.append('  - `motion_unmatched`: `[%`-style motion from the target '
