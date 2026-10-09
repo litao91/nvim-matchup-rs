@@ -8,8 +8,7 @@ use once_cell::sync::Lazy;
 
 use crate::vimregex::{translate, Opts};
 
-static RE_COMMENT_STRING: Lazy<Regex> =
-    Lazy::new(|| Regex::new("(?i)(?:String|Comment)").unwrap());
+static RE_COMMENT_STRING: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)(?:String|Comment)").unwrap());
 
 #[derive(Clone)]
 pub enum SkipKind {
@@ -271,9 +270,7 @@ impl MidSkip {
                 let s = syn_name(lnum, cnum, false);
                 !syn_re.is_match(&s).unwrap_or(false) || base()
             }
-            MidSkip::Skip2 { strike_re } => {
-                strike_re.is_match(suffix).unwrap_or(false) || base()
-            }
+            MidSkip::Skip2 { strike_re } => strike_re.is_match(suffix).unwrap_or(false) || base(),
         }
     }
 }

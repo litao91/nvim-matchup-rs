@@ -246,11 +246,8 @@ fn obj_strlist(o: &Object) -> Option<Vec<String>> {
 /// True when nvim is new enough for the treesitter default (upstream gates on
 /// 0.11.2). Evaluated once per setup() call.
 fn ts_default_enabled() -> bool {
-    crate::nvimrs::call_fn_as::<i64>(
-        "has",
-        &Array::from_iter([Object::from("nvim-0.11.2")]),
-    )
-    .unwrap_or(0)
+    crate::nvimrs::call_fn_as::<i64>("has", &Array::from_iter([Object::from("nvim-0.11.2")]))
+        .unwrap_or(0)
         != 0
 }
 
@@ -630,7 +627,11 @@ impl State {
 
     /// The derived filetype config for `buf` (default when none was applied).
     pub fn ft_config(&self, buf: i32) -> FtConfig {
-        self.ft_config.borrow().get(&buf).cloned().unwrap_or_default()
+        self.ft_config
+            .borrow()
+            .get(&buf)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_ft_config(&self, buf: i32, cfg: FtConfig) {
@@ -639,12 +640,18 @@ impl State {
 
     /// Per-buffer matchparen enable override (None = use the global toggle).
     pub fn ft_matchparen_enabled(&self, buf: i32) -> Option<bool> {
-        self.ft_config.borrow().get(&buf).and_then(|c| c.matchparen_enabled)
+        self.ft_config
+            .borrow()
+            .get(&buf)
+            .and_then(|c| c.matchparen_enabled)
     }
 
     /// Per-buffer highlight timeout override (None = use the global timeout).
     pub fn ft_matchparen_timeout(&self, buf: i32) -> Option<i64> {
-        self.ft_config.borrow().get(&buf).and_then(|c| c.matchparen_timeout)
+        self.ft_config
+            .borrow()
+            .get(&buf)
+            .and_then(|c| c.matchparen_timeout)
     }
 
     /// Effective position for raw `b:match_skip` evaluation.
@@ -1057,7 +1064,15 @@ pub fn ensure_buf(state: &State, buf: &Buffer, ts_words: TsWords) -> i32 {
     for set in &lists.sets {
         let n_extra = set.regextwo.extra_list.len();
         let mk = |vim: &String, extra_idx: usize| -> CompiledWord {
-            compile_word(state, vim, &opts_scan, &opts_class, extra_idx, &set.regextwo, n_extra)
+            compile_word(
+                state,
+                vim,
+                &opts_scan,
+                &opts_class,
+                extra_idx,
+                &set.regextwo,
+                n_extra,
+            )
         };
         let open = mk(&set.regextwo.open, 0);
         let mids: Vec<CompiledWord> = set
@@ -1238,7 +1253,10 @@ fn compile_word(
         };
     }
     let scan_t = translate(vim, opts_scan).ok();
-    let main = scan_t.as_ref().map(|t| t.pattern.clone()).unwrap_or_default();
+    let main = scan_t
+        .as_ref()
+        .map(|t| t.pattern.clone())
+        .unwrap_or_default();
     let scan = scan_t.as_ref().and_then(|t| {
         let mut cache = state.regex_cache.borrow_mut();
         if let Some(re) = cache.get(&t.pattern) {
@@ -1312,8 +1330,7 @@ fn leading_literal(pat: &str) -> Option<String> {
                 }
                 break;
             }
-            '(' | ')' | '[' | ']' | '{' | '}' | '?' | '*' | '+' | '|' | '^'
-            | '$' | '.' => break,
+            '(' | ')' | '[' | ']' | '{' | '}' | '?' | '*' | '+' | '|' | '^' | '$' | '.' => break,
             _ => lit.push(c),
         }
     }

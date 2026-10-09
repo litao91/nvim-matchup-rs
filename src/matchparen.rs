@@ -100,7 +100,13 @@ pub fn setup(state: &SharedState) {
 
     let s = Rc::clone(state);
     create_autocmd_cb(
-        &["CursorMoved", "CursorMovedI", "TextChanged", "TextChangedI", "TextChangedP"],
+        &[
+            "CursorMoved",
+            "CursorMovedI",
+            "TextChanged",
+            "TextChangedI",
+            "TextChangedP",
+        ],
         gid,
         "*",
         move |_a: AutocmdCallbackArgs| {
@@ -144,12 +150,17 @@ pub fn setup(state: &SharedState) {
     });
 
     let s = Rc::clone(state);
-    create_autocmd_cb(&["BufDelete", "BufWipeout"], gid, "*", move |a: AutocmdCallbackArgs| {
-        crate::guard("ac_drop_buf", || {
-            s.drop_buf(a.buffer.handle());
-        });
-        false
-    });
+    create_autocmd_cb(
+        &["BufDelete", "BufWipeout"],
+        gid,
+        "*",
+        move |a: AutocmdCallbackArgs| {
+            crate::guard("ac_drop_buf", || {
+                s.drop_buf(a.buffer.handle());
+            });
+            false
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -161,28 +172,30 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     let g = ctx.gopts;
     let tr = |why: &str| trace(&format!("HL early-out: {why}"));
     if !g.matchparen_enabled {
-        tr("disabled"); return;
+        tr("disabled");
+        return;
     }
-    if crate::nvimrs::call_fn_as::<i64>(
-        "has",
-        &Array::from_iter([Object::from("vim_starting")]),
-    )
-    .unwrap_or(0)
+    if crate::nvimrs::call_fn_as::<i64>("has", &Array::from_iter([Object::from("vim_starting")]))
+        .unwrap_or(0)
         != 0
     {
-        tr("vim_starting"); return;
+        tr("vim_starting");
+        return;
     }
     if g.matchparen_pumvisible == 0 && pumvisible() {
-        tr("pumvisible"); return;
+        tr("pumvisible");
+        return;
     }
     if crate::nvimrs::call_fn_as::<String>("state", &Array::from_iter([Object::from("a")]))
         .map(|s| !s.is_empty())
         .unwrap_or(false)
     {
-        tr("state(a)"); return;
+        tr("state(a)");
+        return;
     }
     if ctx.state.ft_matchparen_enabled(ctx.buf.handle()) == Some(false) {
-        tr("buf disabled"); return;
+        tr("buf disabled");
+        return;
     }
 
     let real_mode: String = if changing_insert {
@@ -193,7 +206,10 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
 
     let cursor = match ctx.cursor() {
         Some(c) => c,
-        None => { tr("no cursor"); return; }
+        None => {
+            tr("no cursor");
+            return;
+        }
     };
     let tick = ctx.buf.get_changedtick().unwrap_or(0);
     let win_h = ctx.win.handle();
@@ -202,7 +218,8 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
         let mp = ctx.state.matchparen.borrow();
         if let Some(ws) = mp.wins.get(&win_h) {
             if ws.last_cursor == Some(cursor) && ws.last_tick == Some(tick) {
-                tr("unchanged"); return;
+                tr("unchanged");
+                return;
             }
         }
     }
@@ -221,7 +238,8 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
 
     // mode blacklist
     if g.matchparen_nomode.contains(&real_mode) {
-        tr("nomode"); return;
+        tr("nomode");
+        return;
     }
 
     // visual-block EOL guard: getcurpos()[4] (off) at INT_MAX while in
@@ -229,10 +247,15 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     {
         let cp: Array = crate::nvimrs::call_fn0_as("getcurpos").unwrap_or_else(Array::new);
         let v: Vec<Object> = cp.into_iter().collect();
-        let off = v.get(3).cloned().and_then(|o| i64::try_from(o).ok()).unwrap_or(0);
+        let off = v
+            .get(3)
+            .cloned()
+            .and_then(|o| i64::try_from(o).ok())
+            .unwrap_or(0);
         let m: String = crate::nvimrs::call_fn0_as("mode").unwrap_or_default();
         if off == 2147483647 && (m == "v" || m == "\x16") {
-            tr("visual-block-eol"); return;
+            tr("visual-block-eol");
+            return;
         }
     }
     if crate::nvimrs::call_fn_as::<i64>(
@@ -242,10 +265,12 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     .unwrap_or(-1)
         > -1
     {
-        tr("foldclosed"); return;
+        tr("foldclosed");
+        return;
     }
     if ctx.synmaxcol != 0 && cursor.cnum as i64 > ctx.synmaxcol {
-        tr("synmaxcol"); return;
+        tr("synmaxcol");
+        return;
     }
 
     let insertmode = real_mode == "i";
@@ -264,7 +289,10 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     o.highlighting = true;
     let current = match engine::get_delim_multi(ctx, &o) {
         Some(d) => d,
-        None => { tr("no current delim"); return; }
+        None => {
+            tr("no current delim");
+            return;
+        }
     };
     ctx.state.perf.toc("matchparen.highlight", "get_current");
 
@@ -278,19 +306,22 @@ pub fn highlight(ctx: &Ctx, force_update: bool, changing_insert: bool) {
     );
     ctx.state.perf.toc("matchparen.highlight", "get_matching");
     if ml.is_empty() {
-        tr("empty matching list"); return;
+        tr("empty matching list");
+        return;
     }
 
     // singleton check (matchparen.vim:456-462)
     let min_len = if current.side == Side::Mid { 3 } else { 2 };
     if ml.len() < min_len && !g.matchparen_singleton {
-        tr("singleton"); return;
+        tr("singleton");
+        return;
     }
 
     // prepare for (possibly) new highlights (fade level 1)
     let pos = Pos::new(current.lnum, current.cnum);
     if fade(ctx, 1, Some(pos), &mut token_save_pos) {
-        tr("fade cancel"); return;
+        tr("fade cancel");
+        return;
     }
 
     {
@@ -335,14 +366,12 @@ fn offscreen_scrolling_disabled(ctx: &Ctx) -> bool {
     };
     let wh: i64 =
         nvimrs::call_fn_as("winheight", &Array::from_iter([Object::from(0i64)])).unwrap_or(0);
-    let scrolloff: i64 =
-        nvimrs::get_option_as("scrolloff", 0, ctx.win.handle()).unwrap_or(0);
+    let scrolloff: i64 = nvimrs::get_option_as("scrolloff", 0, ctx.win.handle()).unwrap_or(0);
     let cur = line(".");
     let wdollar = line("w$");
     let last = line("$");
     let w0 = line("w0");
-    wh > 2 * scrolloff
-        && ((cur == wdollar - scrolloff && last != wdollar) || cur == w0 + scrolloff)
+    wh > 2 * scrolloff && ((cur == wdollar - scrolloff && last != wdollar) || cur == w0 + scrolloff)
 }
 
 fn pumvisible() -> bool {
@@ -454,11 +483,7 @@ pub fn highlight_deferred(ctx: &Ctx) {
 
 fn timer_start(delay_ms: i64, cb: &str) -> std::result::Result<i64, ()> {
     let opts = Dictionary::from_iter([("repeat", Object::from(-1i64))]);
-    let args = Array::from_iter([
-        Object::from(delay_ms),
-        Object::from(cb),
-        Object::from(opts),
-    ]);
+    let args = Array::from_iter([Object::from(delay_ms), Object::from(cb), Object::from(opts)]);
     nvimrs::call_fn_as::<i64>("timer_start", &args).ok_or(())
 }
 
@@ -628,22 +653,21 @@ fn wordish(d: &Delim) -> bool {
 pub fn add_matches(ctx: &Ctx, ml: &MatchingList, current: Option<&Delim>) {
     let ns = ns_id(ctx.state);
     let sarg = |s: &str| Array::from_iter([Object::from(s)]);
-    let mwc: String = if nvimrs::call_fn_as::<i64>("hlexists", &sarg("MatchWordCur")).unwrap_or(0)
-        != 0
-    {
-        "MatchWordCur".to_string()
-    } else {
-        let mw = nvimrs::call_fn_as::<i64>("hlID", &sarg("MatchWord")).unwrap_or(0);
-        let mw_trans =
-            nvimrs::call_fn_as::<i64>("synIDtrans", &Array::from_iter([Object::from(mw)]))
-                .unwrap_or(0);
-        let mp = nvimrs::call_fn_as::<i64>("hlID", &sarg("MatchParen")).unwrap_or(0);
-        if mw_trans == mp {
-            "MatchParenCur".to_string()
+    let mwc: String =
+        if nvimrs::call_fn_as::<i64>("hlexists", &sarg("MatchWordCur")).unwrap_or(0) != 0 {
+            "MatchWordCur".to_string()
         } else {
-            "MatchWord".to_string()
-        }
-    };
+            let mw = nvimrs::call_fn_as::<i64>("hlID", &sarg("MatchWord")).unwrap_or(0);
+            let mw_trans =
+                nvimrs::call_fn_as::<i64>("synIDtrans", &Array::from_iter([Object::from(mw)]))
+                    .unwrap_or(0);
+            let mp = nvimrs::call_fn_as::<i64>("hlID", &sarg("MatchParen")).unwrap_or(0);
+            if mw_trans == mp {
+                "MatchParenCur".to_string()
+            } else {
+                "MatchWord".to_string()
+            }
+        };
 
     let mut buf = ctx.buf.clone();
     for corr in &ml.delims {
@@ -709,7 +733,10 @@ fn highlight_background(ctx: &Ctx, ml: &MatchingList) {
         return;
     }
     let (l1, c1) = (open.lnum, open.cnum);
-    let (l2, c2) = (close.lnum, close.cnum + close.match_.len().saturating_sub(1));
+    let (l2, c2) = (
+        close.lnum,
+        close.cnum + close.match_.len().saturating_sub(1),
+    );
     if l1 == l2 && c1 > c2 {
         return;
     }
@@ -748,8 +775,7 @@ fn highlight_background(ctx: &Ctx, ml: &MatchingList) {
 /// Port of s:do_offscreen (matchparen.vim:538).
 fn do_offscreen(ctx: &Ctx, ml: &MatchingList, current: &Delim, method: &str) {
     let _ = current;
-    let w0: i64 =
-        nvimrs::call_fn_as("line", &Array::from_iter([Object::from("w0")])).unwrap_or(1);
+    let w0: i64 = nvimrs::call_fn_as("line", &Array::from_iter([Object::from("w0")])).unwrap_or(1);
     let wdollar: i64 =
         nvimrs::call_fn_as("line", &Array::from_iter([Object::from("w$")])).unwrap_or(i64::MAX);
 
@@ -863,8 +889,7 @@ fn status_adjust(ctx: &Ctx, ml: &MatchingList, offscreen: &Delim) -> isize {
     }
     let close = ml.close();
     let indent = |lnum: usize| -> i64 {
-        nvimrs::call_fn_as("indent", &Array::from_iter([Object::from(lnum as i64)]))
-            .unwrap_or(0)
+        nvimrs::call_fn_as("indent", &Array::from_iter([Object::from(lnum as i64)])).unwrap_or(0)
     };
     let a = indent(offscreen.lnum);
     let b = indent(close.lnum);
@@ -940,9 +965,8 @@ fn format_gutter(ctx: &Ctx, lnum: usize, noshowdir: bool) -> String {
     let foldlevel: i64 =
         nvimrs::call_fn_as("foldlevel", &Array::from_iter([Object::from(lnum as i64)]))
             .unwrap_or(0);
-    let curline: usize =
-        nvimrs::call_fn_as::<i64>("line", &Array::from_iter([Object::from(".")])).unwrap_or(0)
-            as usize;
+    let curline: usize = nvimrs::call_fn_as::<i64>("line", &Array::from_iter([Object::from(".")]))
+        .unwrap_or(0) as usize;
 
     let mut sl = String::new();
     let direction = lnum < curline;
@@ -1081,7 +1105,10 @@ pub fn status_str(
         } else if b < 32 {
             "SpecialKey".to_string()
         } else {
-            syn_names.get(c).cloned().unwrap_or_else(|| "Normal".to_string())
+            syn_names
+                .get(c)
+                .cloned()
+                .unwrap_or_else(|| "Normal".to_string())
         };
         if curhi != lasthi {
             out.extend_from_slice(format!("%#{curhi}#").as_bytes());

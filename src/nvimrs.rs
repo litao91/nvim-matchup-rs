@@ -46,7 +46,10 @@ struct CError {
 
 impl CError {
     const fn new() -> Self {
-        CError { etype: -1, msg: ptr::null_mut() }
+        CError {
+            etype: -1,
+            msg: ptr::null_mut(),
+        }
     }
     fn is_err(&self) -> bool {
         self.etype != -1
@@ -65,7 +68,11 @@ struct CArray {
 
 impl CArray {
     fn borrow(a: &Array) -> CArray {
-        CArray { size: a.len(), capacity: a.len(), items: a.as_ptr() }
+        CArray {
+            size: a.len(),
+            capacity: a.len(),
+            items: a.as_ptr(),
+        }
     }
 }
 
@@ -74,15 +81,15 @@ impl CArray {
 #[repr(C)]
 struct KeyDictCreateAutocmd {
     is_set: u64,
-    buffer: i32,   // Buffer (deprecated)
-    buf: i32,      // Buffer
+    buffer: i32,      // Buffer (deprecated)
+    buf: i32,         // Buffer
     callback: Object, // Union(String, LuaRef)
     command: CStr,
     desc: CStr,
-    group: Object,    // Union(Integer, String)
+    group: Object, // Union(Integer, String)
     nested: bool,
     once: bool,
-    pattern: Object,  // Union(String, ArrayOf(String))
+    pattern: Object, // Union(String, ArrayOf(String))
 }
 const OPTIDX_AUTOCMD_GROUP: u64 = 4;
 const OPTIDX_AUTOCMD_COMMAND: u64 = 7;
@@ -132,9 +139,9 @@ struct KeyDictEchoOpts {
 #[repr(C)]
 struct KeyDictExecAutocmds {
     is_set: u64,
-    buffer: i32,     // Buffer (deprecated)
-    buf: i32,        // Buffer
-    group: Object,   // Union(Integer, String)
+    buffer: i32,   // Buffer (deprecated)
+    buf: i32,      // Buffer
+    group: Object, // Union(Integer, String)
     modeline: bool,
     pattern: Object, // Union(String, ArrayOf(String))
     data: Object,
@@ -291,27 +298,21 @@ unsafe extern "C" {
         err: *mut CError,
     );
     fn nvim_del_user_command(name: CStr, err: *mut CError);
-    fn nvim_get_option_value(
-        name: CStr,
-        opts: *const KeyDictOption,
-        err: *mut CError,
-    ) -> Object;
+    fn nvim_get_option_value(name: CStr, opts: *const KeyDictOption, err: *mut CError) -> Object;
     fn nvim_get_var(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_get_vvar(name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_buf_get_var(buf: i32, name: CStr, arena: *mut c_void, err: *mut CError) -> Object;
-    fn nvim_get_runtime_file(
-        name: CStr,
-        all: bool,
-        arena: *mut c_void,
-        err: *mut CError,
-    ) -> Array;
+    fn nvim_get_runtime_file(name: CStr, all: bool, arena: *mut c_void, err: *mut CError) -> Array;
 }
 
 // --- safe wrappers ---------------------------------------------------------
 
 fn cstr(s: &str) -> Option<(CString, CStr)> {
     let c = CString::new(s).ok()?;
-    let cs = CStr { data: c.as_ptr(), size: s.len() };
+    let cs = CStr {
+        data: c.as_ptr(),
+        size: s.len(),
+    };
     Some((c, cs))
 }
 
@@ -481,9 +482,8 @@ where
     opts.is_set |= 1 << OPTIDX_AUTOCMD_PATTERN;
 
     let mut err = CError::new();
-    let id = unsafe {
-        nvim_create_autocmd(LUA_INTERNAL_CALL, event, &opts, ptr::null_mut(), &mut err)
-    };
+    let id =
+        unsafe { nvim_create_autocmd(LUA_INTERNAL_CALL, event, &opts, ptr::null_mut(), &mut err) };
     !err.is_err() && id > 0
 }
 
@@ -560,11 +560,10 @@ where
     F: Fn(Dictionary) + 'static,
 {
     use nvim_oxi::Function;
-    let func: Function<Dictionary, ()> =
-        Function::from_fn(move |args| -> nvim_oxi::Result<()> {
-            f(args);
-            Ok(())
-        });
+    let func: Function<Dictionary, ()> = Function::from_fn(move |args| -> nvim_oxi::Result<()> {
+        f(args);
+        Ok(())
+    });
     let cmd = Object::from(func); // tagged LuaRef object
 
     let (_ng, cname) = match cstr(name) {

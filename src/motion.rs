@@ -48,9 +48,8 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
 
 /// Port of matchup#motion_force (matchup.vim:167).
 fn motion_force() -> String {
-    let mode: String =
-        crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-            .unwrap_or_default();
+    let mode: String = crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+        .unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
@@ -83,7 +82,11 @@ fn read_vars(ctx: &Ctx) -> Vars {
     let startofline = get_option_as::<bool>("startofline", 0, 0).unwrap_or(false);
     // during the op() re-feed, v:operator may be cleared; use the stash
     let stashed = ctx.state.op_operator.borrow().clone();
-    let operator = if stashed.is_empty() { operator_v } else { stashed };
+    let operator = if stashed.is_empty() {
+        operator_v
+    } else {
+        stashed
+    };
     Vars {
         count,
         count1,
@@ -171,7 +174,12 @@ fn seed_index(ml: &MatchingList) -> usize {
 pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
     use crate::matchparen::trace;
     let vars = read_vars(ctx);
-    trace(&format!("FMP start visual={visual} down={down} count={} count1={} op={vars:?} cursor={:?}", vars.count, vars.count1, ctx.cursor()));
+    trace(&format!(
+        "FMP start visual={visual} down={down} count={} count1={} op={vars:?} cursor={:?}",
+        vars.count,
+        vars.count1,
+        ctx.cursor()
+    ));
     let force = motion_force();
     let is_oper = !vars.operator.is_empty();
 
@@ -192,10 +200,10 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
 
     if in_indentexpr() {
         ctx.state.perf.timeout_start(300.0);
-        let cur: i64 = crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from(".")]))
-            .unwrap_or(0);
-        let end: i64 = crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from("$")]))
-            .unwrap_or(0);
+        let cur: i64 =
+            crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from(".")])).unwrap_or(0);
+        let end: i64 =
+            crate::nvimrs::call_fn_as("col", &Array::from_iter([Object::from("$")])).unwrap_or(0);
         let col: i64 = if cur >= end { 1 } else { 0 };
         if !vars.startofline && col != 0 {
             normal("^");
@@ -212,11 +220,17 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
             o = GetDelimOpts::new(Direction::Next, SideQuery::BothAll);
             match engine::get_delim_multi(ctx, &o) {
                 Some(d) => d,
-                None => { trace("FMP no delim at all"); return false; }
+                None => {
+                    trace("FMP no delim at all");
+                    return false;
+                }
             }
         }
     };
-    trace(&format!("FMP delim {} {} {:?} side={:?}", delim.lnum, delim.cnum, delim.match_, delim.side));
+    trace(&format!(
+        "FMP delim {} {} {:?} side={:?}",
+        delim.lnum, delim.cnum, delim.match_, delim.side
+    ));
 
     let ml = engine::get_matching(
         ctx,
@@ -242,10 +256,17 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
     trace(&format!("FMP seed_idx {idx}"));
     delim.match_index = ml.delims[idx].match_index;
     for _ in 0..vars.count1 {
-        idx = if down { ml.next_of(idx) } else { ml.prev_of(idx) };
+        idx = if down {
+            ml.next_of(idx)
+        } else {
+            ml.prev_of(idx)
+        };
     }
     let target: Delim = ml.delims[idx].clone();
-    trace(&format!("FMP target {} {} {:?} side={:?} idx={idx}", target.lnum, target.cnum, target.match_, target.side));
+    trace(&format!(
+        "FMP target {} {} {:?} side={:?} idx={idx}",
+        target.lnum, target.cnum, target.match_, target.side
+    ));
 
     if visual && is_oper {
         ensure_visual();
@@ -300,7 +321,11 @@ pub fn find_matching_pair(ctx: &Ctx, visual: bool, down: bool) -> bool {
         let (tl, br, swap) = if start_pos.lnum <= target.lnum {
             ((start_pos.lnum, start_pos.cnum), (target.lnum, eom), false)
         } else {
-            ((target.lnum, target.cnum), (start_pos.lnum, start_pos.cnum), true)
+            (
+                (target.lnum, target.cnum),
+                (start_pos.lnum, start_pos.cnum),
+                true,
+            )
         };
         let tl_line = ctx.lines.get1(tl.0).unwrap_or("");
         let br_line = ctx.lines.get1(br.0).unwrap_or("");
@@ -542,10 +567,7 @@ pub fn jump_inside(ctx: &Ctx, visual: bool) -> bool {
             new_pos = pos_next(line, new_pos);
         }
         let pl = ctx.lines.get1(new_pos.lnum).unwrap_or("");
-        let ppl = ctx
-            .lines
-            .get1(new_pos.lnum.saturating_sub(1))
-            .unwrap_or("");
+        let ppl = ctx.lines.get1(new_pos.lnum.saturating_sub(1)).unwrap_or("");
         new_pos = pos_prev(pl, ppl, new_pos);
     }
 
@@ -744,27 +766,24 @@ pub fn op_motion(ctx: &Ctx, plug: &str) {
     let operator: String = crate::nvimrs::get_vvar_as("operator").unwrap_or_default();
     *ctx.state.op_operator.borrow_mut() = operator;
 
-    let wise = if force.is_empty() { "v" } else { force.as_str() };
+    let wise = if force.is_empty() {
+        "v"
+    } else {
+        force.as_str()
+    };
     let count: i64 = crate::nvimrs::get_vvar_as("count").unwrap_or(0);
     ctx.state.in_op.set(true);
     // args passed directly to the shim (no g: global state)
     let _ = crate::nvimrs::call_fn_as::<i64>(
         "matchup#rs#op_exec",
-        &Array::from_iter([
-            Object::from(wise),
-            Object::from(count),
-            Object::from(plug),
-        ]),
+        &Array::from_iter([Object::from(wise), Object::from(count), Object::from(plug)]),
     );
     ctx.state.in_op.set(false);
     *ctx.state.op_operator.borrow_mut() = String::new();
 }
 
 fn map_rhs(mode: Mode, mode_s: &str, plug_suffix: &str, rhs: &str, default_lhs: Option<&str>) {
-    let opts = SetKeymapOpts::builder()
-        .noremap(true)
-        .silent(true)
-        .build();
+    let opts = SetKeymapOpts::builder().noremap(true).silent(true).build();
     let plug = format!("<Plug>(matchup-{plug_suffix})");
     let _ = api::set_keymap(mode, &plug, rhs, &opts);
     if let Some(lhs) = default_lhs {
@@ -787,9 +806,7 @@ pub fn setup(state: &SharedState) {
     for (suffix, down) in [("%", 1), ("g%", 0)] {
         let n_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(0,{down})<cr>");
         let x_rhs = format!("<cmd>lua require('matchup_rs').motion_matching(1,{down})<cr>");
-        let o_rhs = format!(
-            "<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>"
-        );
+        let o_rhs = format!("<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>");
         map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
         map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
         map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));
@@ -799,9 +816,7 @@ pub fn setup(state: &SharedState) {
     for (suffix, down) in [("]%", 1), ("[%", 0)] {
         let n_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(0,{down})<cr>");
         let x_rhs = format!("<cmd>lua require('matchup_rs').motion_unmatched(1,{down})<cr>");
-        let o_rhs = format!(
-            "<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>"
-        );
+        let o_rhs = format!("<cmd>lua require('matchup_rs').op_motion('matchup-{suffix}')<cr>");
         map_rhs(Mode::Normal, "n", suffix, &n_rhs, Some(suffix));
         map_rhs(Mode::Visual, "x", suffix, &x_rhs, Some(suffix));
         map_rhs(Mode::OperatorPending, "o", suffix, &o_rhs, Some(suffix));

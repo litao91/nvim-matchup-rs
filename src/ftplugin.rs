@@ -96,9 +96,8 @@ fn check(buf: &Buffer, prefix: &str) -> bool {
         Some(m) => m,
         None => return false,
     };
-    let hash: String =
-        crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(m)]))
-            .unwrap_or_default();
+    let hash: String = crate::nvimrs::call_fn_as("sha256", &Array::from_iter([Object::from(m)]))
+        .unwrap_or_default();
     hash.starts_with(prefix)
 }
 
@@ -431,7 +430,11 @@ fn apply(state: &SharedState, buf: &Buffer) {
     }
     let ft = buf_opt(buf, "filetype");
     let gopts = state.gopts();
-    let mut f = Ft { cfg: FtConfig::default(), buf, gopts: &gopts };
+    let mut f = Ft {
+        cfg: FtConfig::default(),
+        buf,
+        gopts: &gopts,
+    };
     match ft.as_str() {
         "c" => ft_c(&mut f),
         "cpp" => ft_cpp(&mut f),

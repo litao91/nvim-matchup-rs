@@ -162,9 +162,8 @@ pub fn language(state: &State, lang: &str) -> Option<Language> {
         unsafe {
             let lib = Library::new(&path).ok()?;
             let sym = format!("tree_sitter_{}\0", sym_lang(lang));
-            let func: libloading::Symbol<
-                unsafe extern "C" fn() -> *const (),
-            > = lib.get(sym.as_bytes()).ok()?;
+            let func: libloading::Symbol<unsafe extern "C" fn() -> *const ()> =
+                lib.get(sym.as_bytes()).ok()?;
             let language = Language::new(LanguageFn::from_raw(*func));
             // keep the library alive alongside the language
             let mut ts = state.ts.borrow_mut();
@@ -356,17 +355,18 @@ fn point_of_lines(text: &str, byte: usize) -> Point {
 
 /// Fetch the (possibly incrementally re-parsed) tree for the buffer.
 /// Returns cloned handles so callers never hold the state borrow.
-fn ensure_tree(
-    state: &State,
-    bufnr: i32,
-    buf: &Buffer,
-) -> Option<(Tree, String, Vec<usize>, u32)> {
+fn ensure_tree(state: &State, bufnr: i32, buf: &Buffer) -> Option<(Tree, String, Vec<usize>, u32)> {
     let tick: u32 = buf.get_changedtick().unwrap_or(0);
     {
         let ts = state.ts.borrow();
         if let Some(bt) = ts.trees.get(&bufnr) {
             if bt.tick == tick {
-                return Some((bt.tree.clone(), bt.text.clone(), bt.line_starts.clone(), tick));
+                return Some((
+                    bt.tree.clone(),
+                    bt.text.clone(),
+                    bt.line_starts.clone(),
+                    tick,
+                ));
             }
         }
     }
@@ -386,9 +386,12 @@ fn ensure_tree(
     #[allow(deprecated)]
     parser.set_timeout_micros(250_000);
 
-    let old = state.ts.borrow().trees.get(&bufnr).map(|bt| {
-        (bt.tree.clone(), bt.text.clone(), bt.lang.clone())
-    });
+    let old = state
+        .ts
+        .borrow()
+        .trees
+        .get(&bufnr)
+        .map(|bt| (bt.tree.clone(), bt.text.clone(), bt.lang.clone()));
     let tree = match old {
         Some((mut old_tree, ref old_text, ref old_lang)) if *old_lang == ft => {
             if let Some(edit) = diff_edit(old_text, &text) {
@@ -437,7 +440,14 @@ fn byte_at(line_starts: &[usize], text_len: usize, row: i64, col: i64) -> usize 
     (start + col as usize).min(end)
 }
 
-fn line_text(text: &str, line_starts: &[usize], row: usize, sc: i64, ec_row_same: bool, ec: i64) -> String {
+fn line_text(
+    text: &str,
+    line_starts: &[usize],
+    row: usize,
+    sc: i64,
+    ec_row_same: bool,
+    ec: i64,
+) -> String {
     if row + 1 >= line_starts.len() {
         return String::new();
     }
@@ -619,9 +629,7 @@ fn collect_matches(
             let nums: Vec<i64> = pred.args[1..5]
                 .iter()
                 .map(|a| match a {
-                    tree_sitter::QueryPredicateArg::String(sv) => {
-                        sv.parse::<i64>().unwrap_or(0)
-                    }
+                    tree_sitter::QueryPredicateArg::String(sv) => sv.parse::<i64>().unwrap_or(0),
                     _ => 0,
                 })
                 .collect();
@@ -646,8 +654,8 @@ fn collect_matches(
             let (_dr1, _dc1, dr2, dc2) = offsets.get(&idx).copied().unwrap_or((0, 0, 0, 0));
             let (mut sr, mut sc) = (sp.row as i64, sp.column as i64);
             let (mut er, mut ec) = (ep.row as i64 + dr2, ep.column as i64 + dc2);
-            let length = byte_at(line_starts, text.len(), er, ec) as i64
-                - first.start_byte() as i64;
+            let length =
+                byte_at(line_starts, text.len(), er, ec) as i64 - first.start_byte() as i64;
             if ec == 0 {
                 if sr == er {
                     sc = -1;
@@ -674,14 +682,7 @@ fn collect_matches(
             };
             let same_row = sr == er && sr >= 0;
             let text_str = if sr >= 0 {
-                line_text(
-                    text,
-                    line_starts,
-                    sr as usize,
-                    sc,
-                    same_row,
-                    ec,
-                )
+                line_text(text, line_starts, sr as usize, sc, same_row, ec)
             } else {
                 String::new()
             };
@@ -769,7 +770,12 @@ fn containing_scope<'t>(
     loop {
         let sp = node.start_position();
         let ep = node.end_position();
-        let id = range_id((sp.row as i64, sp.column as i64, ep.row as i64, ep.column as i64));
+        let id = range_id((
+            sp.row as i64,
+            sp.column as i64,
+            ep.row as i64,
+            ep.column as i64,
+        ));
         if set.contains(&id) {
             return Some((id, sp.row as i64, ep.row as i64, ep.column as i64));
         }
@@ -790,8 +796,7 @@ pub fn active_lang(state: &State, gopts: &GOpts, bufnr: i32) -> Option<String> {
     if !gopts.ts_enabled {
         return None;
     }
-    let ft: String =
-        crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
+    let ft: String = crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     if ft.is_empty() {
         return None;
     }

@@ -33,9 +33,8 @@ fn set_cursor(win: &mut nvim_oxi::api::Window, ctx: &Ctx, p: Pos) {
 }
 
 fn motion_force() -> String {
-    let mode: String =
-        crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
-            .unwrap_or_default();
+    let mode: String = crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+        .unwrap_or_default();
     if mode.len() >= 3 && mode.starts_with("no") {
         mode[2..3].to_string()
     } else {
@@ -82,12 +81,8 @@ fn matchpref(ctx: &Ctx, id: &str, default: bool) -> bool {
 }
 
 fn ishtmllike() -> bool {
-    let ft: String = crate::nvimrs::get_option_as(
-        "filetype",
-        api::get_current_buf().handle(),
-        0,
-    )
-    .unwrap_or_default();
+    let ft: String = crate::nvimrs::get_option_as("filetype", api::get_current_buf().handle(), 0)
+        .unwrap_or_default();
     let first = ft.split('.').next().unwrap_or("");
     matches!(
         first,
@@ -126,11 +121,19 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
     let visualmode = call_fn0_as::<String>("visualmode").unwrap_or_default();
     // getpos("'<")[1:2] / getpos("'>")[1:2] -> (lnum, col) both 1-based
     let mark_pos = |m: &str| -> Pos {
-        let arr: Array = call_fn_as("getpos", &Array::from_iter([Object::from(m)]))
-            .unwrap_or_else(Array::new);
+        let arr: Array =
+            call_fn_as("getpos", &Array::from_iter([Object::from(m)])).unwrap_or_else(Array::new);
         let v: Vec<Object> = arr.into_iter().collect();
-        let lnum = v.get(1).cloned().and_then(|o| i64::try_from(o).ok()).unwrap_or(0);
-        let col = v.get(2).cloned().and_then(|o| i64::try_from(o).ok()).unwrap_or(0);
+        let lnum = v
+            .get(1)
+            .cloned()
+            .and_then(|o| i64::try_from(o).ok())
+            .unwrap_or(0);
+        let col = v
+            .get(2)
+            .cloned()
+            .and_then(|o| i64::try_from(o).ok())
+            .unwrap_or(0);
         Pos::new(lnum as usize, col as usize)
     };
     let sel_start = mark_pos("'<");
@@ -291,11 +294,7 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
         let line_count = l2.saturating_sub(l1) + 1;
 
         // if inner and the selection coincides with open/close, try again
-        if visual
-            && is_inner
-            && sel_start == Pos::new(l1, c1)
-            && sel_end == Pos::new(l2, c2)
-        {
+        if visual && is_inner && sel_start == Pos::new(l1, c1) && sel_end == Pos::new(l2, c2) {
             continue;
         }
 
@@ -361,8 +360,7 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
                 }
 
                 // toggle exclusive: difference between di% and dvi%
-                let mut inclusive =
-                    !sol && Pos::new(l1, c1).val() <= Pos::new(l2, c2).val();
+                let mut inclusive = !sol && Pos::new(l1, c1).val() <= Pos::new(l2, c2).val();
                 if forced == "v" {
                     inclusive = !inclusive;
                 }
@@ -424,7 +422,9 @@ pub fn delimited(ctx: &Ctx, is_inner: bool, visual: bool) {
             c2 += close.end_offset();
 
             // make *a% more like *at for html
-            if ishtmllike() && !matchpref(ctx, "classic_textobj", false) && html_close_like(&close.match_)
+            if ishtmllike()
+                && !matchpref(ctx, "classic_textobj", false)
+                && html_close_like(&close.match_)
             {
                 c1 = c1.saturating_sub(1);
                 if !close.match_.to_lowercase().ends_with('>') {
@@ -525,17 +525,11 @@ pub fn setup(state: &SharedState) {
         return;
     }
 
-    let opts = SetKeymapOpts::builder()
-        .noremap(true)
-        .silent(true)
-        .build();
+    let opts = SetKeymapOpts::builder().noremap(true).silent(true).build();
 
     for (lhs, inner) in [("i%", 1), ("a%", 0)] {
         let plug = format!("<Plug>(matchup-{lhs})");
-        for (mode, mode_s, visual) in [
-            (Mode::Visual, "x", 1),
-            (Mode::OperatorPending, "o", 0),
-        ] {
+        for (mode, mode_s, visual) in [(Mode::Visual, "x", 1), (Mode::OperatorPending, "o", 0)] {
             // visual mode must drop out of visual before the callback (as the
             // original's `:<c-u>` plug does) so that `normal! v` inside
             // re-enters visual mode to apply the new selection; <cmd> would

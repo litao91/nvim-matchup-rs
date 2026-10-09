@@ -271,7 +271,11 @@ fn strip_gspec(word: &str, extra: &mut HashMap<String, String>) -> String {
 
 /// Parse one comma-separated set into regexone/regextwo and append to
 /// lists. Port of loader.vim:196-482.
-fn parse_set(lists: &mut DelimLists, words_in: &[String], extra_list: &mut Vec<HashMap<String, String>>) {
+fn parse_set(
+    lists: &mut DelimLists,
+    words_in: &[String],
+    extra_list: &mut Vec<HashMap<String, String>>,
+) {
     let n = words_in.len();
     let mut words = words_in.to_vec();
     let mut words_backref = words.clone();
@@ -308,7 +312,11 @@ fn parse_set(lists: &mut DelimLists, words_in: &[String], extra_list: &mut Vec<H
         let p1 = p1.min(curaug.len());
         let is_boundary = |s: &str, k: usize| k <= s.len() && s.is_char_boundary(k);
         let cut0 = if is_boundary(&curaug, p0) { p0 } else { 0 };
-        let cut1 = if is_boundary(&curaug, p1) { p1 } else { curaug.len() };
+        let cut1 = if is_boundary(&curaug, p1) {
+            p1
+        } else {
+            curaug.len()
+        };
         curaug = format!("{}\\{}{}", &curaug[..cut0], j, &curaug[cut1..]);
         augments.insert(j, curaug.clone());
     }
@@ -351,8 +359,7 @@ fn parse_set(lists: &mut DelimLists, words_in: &[String], extra_list: &mut Vec<H
             // renumber any remaining `\bref` occurrences
             let renumbered = renu.iter().find(|(_, &v)| v == bref).map(|(&k, _)| k);
             if let Some(local) = renumbered {
-                words_backref[i] =
-                    replace_all_backref(&words_backref[i], bref, local);
+                words_backref[i] = replace_all_backref(&words_backref[i], bref, local);
             }
         }
         group_renumber.insert(i, renu);
@@ -577,11 +584,7 @@ pub fn remove_capture_groups(re: &str) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < cs.len() {
-        if cs[i] == '\\'
-            && not_bslash_char(&cs, i)
-            && i + 1 < cs.len()
-            && cs[i + 1] == '('
-        {
+        if cs[i] == '\\' && not_bslash_char(&cs, i) && i + 1 < cs.len() && cs[i + 1] == '(' {
             out.push_str(r"\%(");
             i += 2;
             continue;
@@ -613,7 +616,12 @@ pub fn process_hlend(re: &str, cursorpos: isize) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < cs.len() {
-        if cs[i] == '\\' && not_bslash_char(&cs, i) && i + 1 < cs.len() && cs[i + 1] == 'z' && i + 2 < cs.len() && cs[i + 2] == 'e'
+        if cs[i] == '\\'
+            && not_bslash_char(&cs, i)
+            && i + 1 < cs.len()
+            && cs[i + 1] == 'z'
+            && i + 2 < cs.len()
+            && cs[i + 2] == 'e'
         {
             if cursorpos >= 0 {
                 out.push_str(&format!(r"\%>{}c", cursorpos));
@@ -647,7 +655,10 @@ fn find_backrefs(re: &str) -> Vec<Grp> {
     let mut out: Vec<Grp> = Vec::new();
     let mut i = 0;
     while i + 1 < cs.len() {
-        if cs[i] == '\\' && not_bslash_char(&cs, i) && cs[i + 1].is_ascii_digit() && cs[i + 1] != '0'
+        if cs[i] == '\\'
+            && not_bslash_char(&cs, i)
+            && cs[i + 1].is_ascii_digit()
+            && cs[i + 1] != '0'
         {
             let n = cs[i + 1] as Grp - '0' as Grp;
             if !out.contains(&n) {
@@ -756,7 +767,10 @@ mod tests {
         assert_eq!(lists.sets[0].regexone.open, "(");
         assert_eq!(lists.sets[0].regexone.close, ")");
         // bare [:] is escaped
-        assert_eq!(lists.sets[2].regexone.open, r"\[:]".split(':').next().unwrap());
+        assert_eq!(
+            lists.sets[2].regexone.open,
+            r"\[:]".split(':').next().unwrap()
+        );
     }
 
     #[test]
@@ -811,10 +825,7 @@ mod tests {
             Some(&"1".to_string())
         );
         // process_hlend turns the marker into \ze
-        assert_eq!(
-            process_hlend(&s.regexone.open, -1),
-            r"\<if\>\ze"
-        );
+        assert_eq!(process_hlend(&s.regexone.open, -1), r"\<if\>\ze");
     }
 
     #[test]

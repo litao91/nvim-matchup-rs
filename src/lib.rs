@@ -117,10 +117,7 @@ fn delim_to_dict(d: &Delim) -> Dictionary {
 }
 
 /// Run `f` with a context for the current buffer/window.
-pub(crate) fn with_ctx<R>(
-    state: &SharedState,
-    f: impl FnOnce(&Ctx) -> R,
-) -> Option<R> {
+pub(crate) fn with_ctx<R>(state: &SharedState, f: impl FnOnce(&Ctx) -> R) -> Option<R> {
     let buf = api::get_current_buf();
     let win = api::get_current_win();
     with_ctx_for(state, &buf, &win, f)
@@ -205,12 +202,16 @@ fn activate(state: &SharedState) {
         });
     });
     let s = Rc::clone(state);
-    nvimrs::create_user_command_cb("MatchupReload", "Reload matchup per-buffer state", move |_| {
-        guard("cmd_MatchupReload", || {
-            s.reload();
-            with_ctx(&s, |ctx| matchparen::highlight(ctx, true, false));
-        });
-    });
+    nvimrs::create_user_command_cb(
+        "MatchupReload",
+        "Reload matchup per-buffer state",
+        move |_| {
+            guard("cmd_MatchupReload", || {
+                s.reload();
+                with_ctx(&s, |ctx| matchparen::highlight(ctx, true, false));
+            });
+        },
+    );
     let s = Rc::clone(state);
     nvimrs::create_user_command_cb("MatchupShowTimes", "Show matchup perf timings", move |_| {
         guard("cmd_MatchupShowTimes", || emit_times(&s));
@@ -246,123 +247,127 @@ fn matchup_rs() -> Result<Dictionary> {
     // ---- raw engine API (tests, benchmarks, interop) ----
 
     let s = Rc::clone(&state);
-    let get_delim: Function<(String, String, Option<Dictionary>), Object> =
-        Function::from_fn(
-            move |(dir, side, opts): (String, String, Option<Dictionary>)| -> nvim_oxi::Result<Object> {
-        Ok(guard("get_delim", || -> Object {
-        let direction = match parse_direction(&dir) {
-            Some(d) => d,
-            None => return Object::nil(),
-        };
-        let sideq = parse_side(&side).unwrap_or(SideQuery::BothAll);
-        let mut o = GetDelimOpts::new(direction, sideq);
-        if let Some(opts) = opts {
-            if let Some(v) = opts.get("insertmode").and_then(obj_bool) {
-                o.insertmode = v;
-            }
-            if let Some(v) = opts.get("highlighting").and_then(obj_bool) {
-                o.highlighting = v;
-            }
-            if let Some(v) = opts.get("stopline").and_then(|v| i64::try_from(v.clone()).ok()) {
-                o.stopline = v.max(0) as usize;
-            }
-            if let Some(v) = opts.get("check_skip").and_then(obj_bool) {
-                o.check_skip = Some(v);
-            }
-            if let (Some(l), Some(c)) = (
-                opts.get("lnum").and_then(|v| i64::try_from(v.clone()).ok()),
-                opts.get("cnum").and_then(|v| i64::try_from(v.clone()).ok()),
-            ) {
-                o.at = Some(types::Pos::new(l.max(1) as usize, c.max(1) as usize));
-            }
-        }
-        let r = with_ctx(&s, |ctx| {
-            s.perf.timeout_start(0.0); // no budget for raw calls
-            engine::get_delim_multi(ctx, &o).map(|d| Object::from(delim_to_dict(&d)))
-        });
-        r.flatten().unwrap_or_else(Object::nil)
-        }))
-    });
+    let get_delim: Function<(String, String, Option<Dictionary>), Object> = Function::from_fn(
+        move |(dir, side, opts): (String, String, Option<Dictionary>)| -> nvim_oxi::Result<Object> {
+            Ok(guard("get_delim", || -> Object {
+                let direction = match parse_direction(&dir) {
+                    Some(d) => d,
+                    None => return Object::nil(),
+                };
+                let sideq = parse_side(&side).unwrap_or(SideQuery::BothAll);
+                let mut o = GetDelimOpts::new(direction, sideq);
+                if let Some(opts) = opts {
+                    if let Some(v) = opts.get("insertmode").and_then(obj_bool) {
+                        o.insertmode = v;
+                    }
+                    if let Some(v) = opts.get("highlighting").and_then(obj_bool) {
+                        o.highlighting = v;
+                    }
+                    if let Some(v) = opts
+                        .get("stopline")
+                        .and_then(|v| i64::try_from(v.clone()).ok())
+                    {
+                        o.stopline = v.max(0) as usize;
+                    }
+                    if let Some(v) = opts.get("check_skip").and_then(obj_bool) {
+                        o.check_skip = Some(v);
+                    }
+                    if let (Some(l), Some(c)) = (
+                        opts.get("lnum").and_then(|v| i64::try_from(v.clone()).ok()),
+                        opts.get("cnum").and_then(|v| i64::try_from(v.clone()).ok()),
+                    ) {
+                        o.at = Some(types::Pos::new(l.max(1) as usize, c.max(1) as usize));
+                    }
+                }
+                let r = with_ctx(&s, |ctx| {
+                    s.perf.timeout_start(0.0); // no budget for raw calls
+                    engine::get_delim_multi(ctx, &o).map(|d| Object::from(delim_to_dict(&d)))
+                });
+                r.flatten().unwrap_or_else(Object::nil)
+            }))
+        },
+    );
 
     let s = Rc::clone(&state);
-    let get_matching_at: Function<(i64, i64, Option<bool>), Object> =
-        Function::from_fn(
-            move |(lnum, cnum, highlighting): (i64, i64, Option<bool>)| -> nvim_oxi::Result<Object> {
-        Ok(guard("get_matching_at", || -> Object {
-        let r = with_ctx(&s, |ctx| {
-            s.perf.timeout_start(0.0);
-            let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
-            o.at = Some(types::Pos::new(lnum.max(1) as usize, cnum.max(1) as usize));
-            o.highlighting = highlighting.unwrap_or(false);
-            let seed = match engine::get_delim_multi(ctx, &o) {
-                Some(d) => d,
-                None => return Object::nil(),
-            };
-            let ml = engine::get_matching(
-                ctx,
-                &seed,
-                &MatchOpts {
-                    stopline: 0,
-                    highlighting: o.highlighting,
-                },
-            );
-            let arr: Array = ml
-                .delims
-                .iter()
-                .map(|d| {
-                    Object::from(Array::from_iter([
-                        Object::from(d.match_.clone()),
-                        Object::from(d.lnum as i64),
-                        Object::from(d.cnum as i64),
-                        Object::from(d.side.as_str()),
-                        Object::from(d.match_index as i64),
+    let get_matching_at: Function<(i64, i64, Option<bool>), Object> = Function::from_fn(
+        move |(lnum, cnum, highlighting): (i64, i64, Option<bool>)| -> nvim_oxi::Result<Object> {
+            Ok(guard("get_matching_at", || -> Object {
+                let r = with_ctx(&s, |ctx| {
+                    s.perf.timeout_start(0.0);
+                    let mut o = GetDelimOpts::new(Direction::Current, SideQuery::BothAll);
+                    o.at = Some(types::Pos::new(lnum.max(1) as usize, cnum.max(1) as usize));
+                    o.highlighting = highlighting.unwrap_or(false);
+                    let seed = match engine::get_delim_multi(ctx, &o) {
+                        Some(d) => d,
+                        None => return Object::nil(),
+                    };
+                    let ml = engine::get_matching(
+                        ctx,
+                        &seed,
+                        &MatchOpts {
+                            stopline: 0,
+                            highlighting: o.highlighting,
+                        },
+                    );
+                    let arr: Array = ml
+                        .delims
+                        .iter()
+                        .map(|d| {
+                            Object::from(Array::from_iter([
+                                Object::from(d.match_.clone()),
+                                Object::from(d.lnum as i64),
+                                Object::from(d.cnum as i64),
+                                Object::from(d.side.as_str()),
+                                Object::from(d.match_index as i64),
+                            ]))
+                        })
+                        .collect();
+                    Object::from(Dictionary::from_iter([
+                        ("delims", Object::from(arr)),
+                        ("seed_index", Object::from(ml.seed_index() as i64)),
                     ]))
-                })
-                .collect();
-            Object::from(Dictionary::from_iter([
-                ("delims", Object::from(arr)),
-                ("seed_index", Object::from(ml.seed_index() as i64)),
-            ]))
-        });
-        r.unwrap_or_else(Object::nil)
-        }))
-    });
+                });
+                r.unwrap_or_else(Object::nil)
+            }))
+        },
+    );
 
     let s = Rc::clone(&state);
-    let get_surrounding_at: Function<(Option<i64>, Option<bool>), Object> =
-        Function::from_fn(
-            move |(count, local): (Option<i64>, Option<bool>)| -> nvim_oxi::Result<Object> {
-        Ok(guard("get_surrounding_at", || -> Object {
-        let r = with_ctx(&s, |ctx| {
-            s.perf.timeout_start(0.0);
-            let opts = SurroundOpts {
-                local,
-                stopline: 0,
-                check_skip: false,
-                highlighting: false,
-            };
-            match engine::get_surrounding(ctx, count.unwrap_or(1).max(0) as usize, &opts) {
-                Some((open, close, _ml)) => Object::from(Array::from_iter([
-                    Object::from(delim_to_dict(&open)),
-                    Object::from(delim_to_dict(&close)),
-                ])),
-                None => Object::nil(),
-            }
-        });
-        r.unwrap_or_else(Object::nil)
-        }))
-    });
+    let get_surrounding_at: Function<(Option<i64>, Option<bool>), Object> = Function::from_fn(
+        move |(count, local): (Option<i64>, Option<bool>)| -> nvim_oxi::Result<Object> {
+            Ok(guard("get_surrounding_at", || -> Object {
+                let r = with_ctx(&s, |ctx| {
+                    s.perf.timeout_start(0.0);
+                    let opts = SurroundOpts {
+                        local,
+                        stopline: 0,
+                        check_skip: false,
+                        highlighting: false,
+                    };
+                    match engine::get_surrounding(ctx, count.unwrap_or(1).max(0) as usize, &opts) {
+                        Some((open, close, _ml)) => Object::from(Array::from_iter([
+                            Object::from(delim_to_dict(&open)),
+                            Object::from(delim_to_dict(&close)),
+                        ])),
+                        None => Object::nil(),
+                    }
+                });
+                r.unwrap_or_else(Object::nil)
+            }))
+        },
+    );
 
     // ---- matchparen ----
 
     let s = Rc::clone(&state);
-    let highlight: Function<(Option<bool>,), ()> = Function::from_fn(move |(force,): (Option<bool>,)| -> nvim_oxi::Result<()> {
-        let f = force.unwrap_or(false);
-        guard("highlight", || {
-            with_ctx(&s, |ctx| matchparen::highlight(ctx, f, false));
+    let highlight: Function<(Option<bool>,), ()> =
+        Function::from_fn(move |(force,): (Option<bool>,)| -> nvim_oxi::Result<()> {
+            let f = force.unwrap_or(false);
+            guard("highlight", || {
+                with_ctx(&s, |ctx| matchparen::highlight(ctx, f, false));
+            });
+            Ok(())
         });
-        Ok(())
-    });
 
     let s = Rc::clone(&state);
     let clear: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
@@ -379,10 +384,11 @@ fn matchup_rs() -> Result<Dictionary> {
     });
 
     let s = Rc::clone(&state);
-    let drop_buf: Function<(i64,), ()> = Function::from_fn(move |(b,): (i64,)| -> nvim_oxi::Result<()> {
-        s.drop_buf(b as i32);
-        Ok(())
-    });
+    let drop_buf: Function<(i64,), ()> =
+        Function::from_fn(move |(b,): (i64,)| -> nvim_oxi::Result<()> {
+            s.drop_buf(b as i32);
+            Ok(())
+        });
 
     // :NoMatchParen / :DoMatchParen runtime toggle (via autoload/matchup/rs.vim).
     let s = Rc::clone(&state);
@@ -395,16 +401,16 @@ fn matchup_rs() -> Result<Dictionary> {
     // matchup#util#matchpref bridge for the ftplugin definitions: looks up
     // <ft>.<id> in the setup(opts) matchpref table.
     let s = Rc::clone(&state);
-    let matchpref: Function<(String, String, bool), bool> =
-        Function::from_fn(move |(ft, id, dflt): (String, String, bool)| -> nvim_oxi::Result<bool> {
+    let matchpref: Function<(String, String, bool), bool> = Function::from_fn(
+        move |(ft, id, dflt): (String, String, bool)| -> nvim_oxi::Result<bool> {
             let g = s.gopts();
-            Ok(g
-                .matchpref
+            Ok(g.matchpref
                 .get(&ft)
                 .and_then(|m| m.get(&id))
                 .copied()
                 .unwrap_or(dflt))
-        });
+        },
+    );
 
     // FileType autocmd handler: apply the native ftplugin definition.
     let s = Rc::clone(&state);
@@ -424,32 +430,33 @@ fn matchup_rs() -> Result<Dictionary> {
     // ---- setup: autocmds, keymaps, commands ----
 
     let s = Rc::clone(&state);
-    let setup: Function<(Option<Dictionary>,), ()> =
-        Function::from_fn(move |(opts,): (Option<Dictionary>,)| -> nvim_oxi::Result<()> {
-        install_panic_hook();
-        guard("setup", || {
-            let st = Rc::clone(&s);
-            if nvimrs::call_fn_as::<i64>(
-                "has",
-                &Array::from_iter([Object::from("nvim-0.11.0")]),
-            )
-            .unwrap_or(0)
-                == 0
-            {
-                nvimrs::echo("matchup-rs requires neovim >= 0.11");
-            }
-            let gopts = GOpts::from_opts(&GOpts::default(), opts.as_ref());
-            st.set_gopts(gopts);
-            // One-time activation (highlight groups, matchit/pi_paren
-            // neutralization, user commands). Idempotent across re-setup.
-            activate(&st);
-            ftplugin::setup(&st);
-            matchparen::setup(&st);
-            motion::setup(&st);
-            textobj::setup(&st);
-        });
-        Ok(())
-    });
+    let setup: Function<(Option<Dictionary>,), ()> = Function::from_fn(
+        move |(opts,): (Option<Dictionary>,)| -> nvim_oxi::Result<()> {
+            install_panic_hook();
+            guard("setup", || {
+                let st = Rc::clone(&s);
+                if nvimrs::call_fn_as::<i64>(
+                    "has",
+                    &Array::from_iter([Object::from("nvim-0.11.0")]),
+                )
+                .unwrap_or(0)
+                    == 0
+                {
+                    nvimrs::echo("matchup-rs requires neovim >= 0.11");
+                }
+                let gopts = GOpts::from_opts(&GOpts::default(), opts.as_ref());
+                st.set_gopts(gopts);
+                // One-time activation (highlight groups, matchit/pi_paren
+                // neutralization, user commands). Idempotent across re-setup.
+                activate(&st);
+                ftplugin::setup(&st);
+                matchparen::setup(&st);
+                motion::setup(&st);
+                textobj::setup(&st);
+            });
+            Ok(())
+        },
+    );
 
     // ---- deferred timer callbacks (via vimscript shim) ----
 
@@ -488,10 +495,6 @@ fn matchup_rs() -> Result<Dictionary> {
         Ok(())
     });
 
-
-
-
-
     // ---- motions & text objects (called from <cmd> keymap rhs) ----
 
     /// Run a motion; if it made no progress while an operator is pending,
@@ -501,11 +504,9 @@ fn matchup_rs() -> Result<Dictionary> {
             with_ctx(state, |ctx| {
                 let moved = f(ctx);
                 if !moved {
-                    let m: String = nvimrs::call_fn_as(
-                        "mode",
-                        &Array::from_iter([Object::from(1i64)]),
-                    )
-                    .unwrap_or_default();
+                    let m: String =
+                        nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+                            .unwrap_or_default();
                     if m.starts_with("no") {
                         let k = nvim_oxi::String::from("\x1b");
                         let md = nvim_oxi::String::from("n");
@@ -553,13 +554,12 @@ fn matchup_rs() -> Result<Dictionary> {
         });
 
     let s = Rc::clone(&state);
-    let motion_insert: Function<(), ()> =
-        Function::from_fn(move |()| -> nvim_oxi::Result<()> {
-            guard("motion_insert", || {
-                with_ctx(&s, |ctx| motion::insert_mode(ctx));
-            });
-            Ok(())
+    let motion_insert: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+        guard("motion_insert", || {
+            with_ctx(&s, |ctx| motion::insert_mode(ctx));
         });
+        Ok(())
+    });
 
     let s = Rc::clone(&state);
     let op_motion: Function<(String,), ()> =
@@ -574,21 +574,18 @@ fn matchup_rs() -> Result<Dictionary> {
     let textobj: Function<(i64, i64), ()> =
         Function::from_fn(move |(inner, visual): (i64, i64)| -> nvim_oxi::Result<()> {
             guard("textobj", || {
-                with_ctx(&s, |ctx| {
-                    textobj::delimited(ctx, inner != 0, visual != 0)
-                });
+                with_ctx(&s, |ctx| textobj::delimited(ctx, inner != 0, visual != 0));
             });
             Ok(())
         });
 
     let s = Rc::clone(&state);
-    let update_insert: Function<(), ()> =
-        Function::from_fn(move |()| -> nvim_oxi::Result<()> {
-            guard("update_insert", || {
-                with_ctx(&s, |ctx| matchparen::highlight(ctx, true, true));
-            });
-            Ok(())
+    let update_insert: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
+        guard("update_insert", || {
+            with_ctx(&s, |ctx| matchparen::highlight(ctx, true, true));
         });
+        Ok(())
+    });
 
     // Introspection: the resolved per-buffer config the engine actually uses
     // (Rust FtConfig, falling back to nvim-runtime/user b: inputs). Used by the
@@ -596,40 +593,43 @@ fn matchup_rs() -> Result<Dictionary> {
     let s = Rc::clone(&state);
     let buffer_config: Function<(), Object> =
         Function::from_fn(move |()| -> nvim_oxi::Result<Object> {
-        Ok(guard("buffer_config", || -> Object {
-            let buf = api::get_current_buf();
-            let h = buf.handle();
-            let ftc = s.ft_config(h);
-            let bvar = |n: &str| buf.get_var::<String>(n).unwrap_or_default();
-            let mw = ftc.match_words.clone().unwrap_or_else(|| bvar("match_words"));
-            let ms = ftc.match_skip.clone().unwrap_or_else(|| bvar("match_skip"));
-            let mp = nvimrs::get_option_as::<String>("matchpairs", h, 0).unwrap_or_default();
-            let ic = buf
-                .get_var::<i64>("match_ignorecase")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            let mpe = match ftc.matchparen_enabled {
-                Some(b) => if b { "1" } else { "0" }.to_string(),
-                None => String::new(),
-            };
-            let mm = ftc.midmap.map(|pairs| {
-                Object::from(Array::from_iter(pairs.into_iter().map(|(a, b)| {
-                    Object::from(Array::from_iter([Object::from(a), Object::from(b)]))
-                })))
-            });
-            let mut d = Dictionary::from_iter([
-                ("match_words", Object::from(mw)),
-                ("match_skip", Object::from(ms)),
-                ("matchpairs", Object::from(mp)),
-                ("ignorecase", Object::from(ic)),
-                ("nomatchpairs", Object::from(ftc.nomatchpairs)),
-                ("matchparen_enabled", Object::from(mpe)),
-            ]);
-            if let Some(mm) = mm {
-                d.insert("midmap", mm);
-            }
-            Object::from(d)
-        }))
+            Ok(guard("buffer_config", || -> Object {
+                let buf = api::get_current_buf();
+                let h = buf.handle();
+                let ftc = s.ft_config(h);
+                let bvar = |n: &str| buf.get_var::<String>(n).unwrap_or_default();
+                let mw = ftc
+                    .match_words
+                    .clone()
+                    .unwrap_or_else(|| bvar("match_words"));
+                let ms = ftc.match_skip.clone().unwrap_or_else(|| bvar("match_skip"));
+                let mp = nvimrs::get_option_as::<String>("matchpairs", h, 0).unwrap_or_default();
+                let ic = buf
+                    .get_var::<i64>("match_ignorecase")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let mpe = match ftc.matchparen_enabled {
+                    Some(b) => if b { "1" } else { "0" }.to_string(),
+                    None => String::new(),
+                };
+                let mm = ftc.midmap.map(|pairs| {
+                    Object::from(Array::from_iter(pairs.into_iter().map(|(a, b)| {
+                        Object::from(Array::from_iter([Object::from(a), Object::from(b)]))
+                    })))
+                });
+                let mut d = Dictionary::from_iter([
+                    ("match_words", Object::from(mw)),
+                    ("match_skip", Object::from(ms)),
+                    ("matchpairs", Object::from(mp)),
+                    ("ignorecase", Object::from(ic)),
+                    ("nomatchpairs", Object::from(ftc.nomatchpairs)),
+                    ("matchparen_enabled", Object::from(mpe)),
+                ]);
+                if let Some(mm) = mm {
+                    d.insert("midmap", mm);
+                }
+                Object::from(d)
+            }))
         });
 
     // Effective cursor position for raw b:match_skip evaluation, held in Rust
@@ -653,7 +653,9 @@ fn matchup_rs() -> Result<Dictionary> {
     let s = Rc::clone(&state);
     let scroll_update: Function<(i64,), String> =
         Function::from_fn(move |(lnum,)| -> nvim_oxi::Result<String> {
-            Ok(guard("scroll_update", || matchparen::scroll_update(&s, lnum)))
+            Ok(guard("scroll_update", || {
+                matchparen::scroll_update(&s, lnum)
+            }))
         });
 
     Ok(Dictionary::from_iter([
@@ -668,7 +670,10 @@ fn matchup_rs() -> Result<Dictionary> {
         ("clear", Object::from(clear)),
         ("reload", Object::from(reload)),
         ("drop_buf", Object::from(drop_buf)),
-        ("set_matchparen_enabled", Object::from(set_matchparen_enabled)),
+        (
+            "set_matchparen_enabled",
+            Object::from(set_matchparen_enabled),
+        ),
         ("matchpref", Object::from(matchpref)),
         ("apply_ftplugin", Object::from(apply_ftplugin)),
         ("show_times", Object::from(show_times)),
@@ -682,7 +687,10 @@ fn matchup_rs() -> Result<Dictionary> {
         ("motion_matching", Object::from(motion_matching)),
         ("motion_unmatched", Object::from(motion_unmatched)),
         ("motion_jump_inside", Object::from(motion_jump_inside)),
-        ("motion_jump_inside_prev", Object::from(motion_jump_inside_prev)),
+        (
+            "motion_jump_inside_prev",
+            Object::from(motion_jump_inside_prev),
+        ),
         ("motion_insert", Object::from(motion_insert)),
         ("op_motion", Object::from(op_motion)),
         ("textobj", Object::from(textobj)),

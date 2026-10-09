@@ -468,7 +468,9 @@ fn collect_backrefs(n: &Node, out: &mut std::collections::HashSet<u32>) {
                 collect_backrefs(a, out);
             }
         }
-        Node::Quantified { atom, .. } | Node::Lookahead { atom, .. } | Node::Lookbehind { atom, .. } => {
+        Node::Quantified { atom, .. }
+        | Node::Lookahead { atom, .. }
+        | Node::Lookbehind { atom, .. } => {
             collect_backrefs(atom, out);
         }
         _ => {}
@@ -1282,9 +1284,7 @@ fn fixed_size(n: &Node) -> bool {
 
 fn contains_capture(n: &Node) -> bool {
     match n {
-        Node::Group { capture, alt } => {
-            *capture || alt.iter().any(contains_capture)
-        }
+        Node::Group { capture, alt } => *capture || alt.iter().any(contains_capture),
         Node::Optional { alt } | Node::Alt(alt) | Node::Conj(alt) => {
             alt.iter().any(contains_capture)
         }
@@ -1564,10 +1564,7 @@ fn emit_top_concat(v: &[Node], out: &mut String, ec: &mut EmitCtx) -> Result<()>
 
     ec.top = false;
     if !pre.is_empty() {
-        if pre
-            .iter()
-            .all(|x| min_size(x) == 0 && fixed_size(x))
-        {
+        if pre.iter().all(|x| min_size(x) == 0 && fixed_size(x)) {
             // Zero-width prefix (`^`, `\<`, lookarounds): keep inline; it
             // asserts at the match start.
             for x in pre {
@@ -1691,7 +1688,11 @@ pub fn get_capture_groups(s: &str) -> Vec<(usize, CaptureGroup)> {
             let gstr = s[start..end].to_string();
             let cgstack: Vec<usize> = stack.iter().map(|x| x.0).filter(|x| *x > 0).collect();
             let depth = cgstack.len() + 1;
-            let parent = if cgstack.len() >= 1 { *cgstack.last().unwrap() } else { 0 };
+            let parent = if cgstack.len() >= 1 {
+                *cgstack.last().unwrap()
+            } else {
+                0
+            };
             out.push((
                 n,
                 CaptureGroup {
@@ -1817,10 +1818,7 @@ mod tests {
     fn groups_and_alts() {
         assert_eq!(t(r"\%(foo\|bar\)"), "(?:foo|bar)");
         assert_eq!(t(r"\(foo\)"), "(foo)");
-        assert_eq!(
-            t(r"\%(wh\%[ile]\|for\)"),
-            "(?:wh(?:i(?:l(?:e)?)?)?|for)"
-        );
+        assert_eq!(t(r"\%(wh\%[ile]\|for\)"), "(?:wh(?:i(?:l(?:e)?)?)?|for)");
     }
 
     #[test]
@@ -1846,10 +1844,7 @@ mod tests {
     fn lookarounds() {
         // Variable-width lookbehind becomes a prefix-check obligation.
         let tr = tt(r"\%(\%(^\||\)\s*\)\@<=\<retu\%[rn]\>");
-        assert_eq!(
-            tr.pattern,
-            r"(?<!\w)(?=\w)retu(?:r(?:n)?)?(?<=\w)(?!\w)"
-        );
+        assert_eq!(tr.pattern, r"(?<!\w)(?=\w)retu(?:r(?:n)?)?(?<=\w)(?!\w)");
         assert_eq!(
             tr.prefix_checks,
             vec![PrefixCheck {
@@ -1870,10 +1865,7 @@ mod tests {
 
     #[test]
     fn zs_ze() {
-        assert_eq!(
-            t(r"\<if\>\ze\s"),
-            r"(?<!\w)(?=\w)if(?<=\w)(?!\w)(?=\s)"
-        );
+        assert_eq!(t(r"\<if\>\ze\s"), r"(?<!\w)(?=\w)if(?<=\w)(?!\w)(?=\s)");
         assert_eq!(t(r"foo\zsbar"), "(?<=foo)bar");
         assert_eq!(t(r"a\zsB\zeC"), "(?<=a)B(?=C)");
         // Variable-width \zs prefix becomes an obligation.
@@ -1952,10 +1944,7 @@ mod tests {
 
     #[test]
     fn split_not_bslash_works() {
-        assert_eq!(
-            split_not_bslash(r"a:b\:c:d", ':'),
-            vec!["a", r"b\:c", "d"]
-        );
+        assert_eq!(split_not_bslash(r"a:b\:c:d", ':'), vec!["a", r"b\:c", "d"]);
         assert_eq!(split_not_bslash(r"a\\:b", ':'), vec![r"a\\", "b"]);
     }
 
@@ -2004,8 +1993,8 @@ mod tests {
         // each prefix check must match the text ending exactly at p.
         let tr = tt(r"\%(\%(^\||\)\s*\)\@<=\<retu\%[rn]\>");
         let main = fancy_regex::Regex::new(&tr.pattern).unwrap();
-        let check = fancy_regex::Regex::new(&format!(r"(?:{})\z", tr.prefix_checks[0].pattern))
-            .unwrap();
+        let check =
+            fancy_regex::Regex::new(&format!(r"(?:{})\z", tr.prefix_checks[0].pattern)).unwrap();
 
         // "  return x": match at col 2, prefix "  " satisfies ^\s*
         let line = "  return x";
@@ -2095,7 +2084,12 @@ mod tests {
         let cs: Vec<char> = s.chars().collect();
         let mut i = 0;
         while i < cs.len() {
-            if cs[i] == '\\' && i + 1 < cs.len() && cs[i + 1] == 'g' && i + 2 < cs.len() && cs[i + 2] == '{' {
+            if cs[i] == '\\'
+                && i + 1 < cs.len()
+                && cs[i + 1] == 'g'
+                && i + 2 < cs.len()
+                && cs[i + 2] == '{'
+            {
                 let mut j = i + 3;
                 while j < cs.len() && cs[j] != '}' {
                     j += 1;

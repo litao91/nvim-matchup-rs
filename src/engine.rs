@@ -124,15 +124,16 @@ impl<'a> Ctx<'a> {
         let cursor = win.get_cursor().map(|(r, _)| r).unwrap_or(1);
         let margin = gopts.delim_stopline.max(gopts.matchparen_stopline) + 100;
         let lines = Lines::fetch_for_cursor(&buf, cursor, margin);
-        let mode: String = crate::nvimrs::call_fn_as(
-            "mode",
-            &Array::from_iter([Object::from(1i64)]),
-        )
-        .unwrap_or_else(|| "n".to_string());
+        let mode: String =
+            crate::nvimrs::call_fn_as("mode", &Array::from_iter([Object::from(1i64)]))
+                .unwrap_or_else(|| "n".to_string());
         let synmaxcol: i64 =
             crate::nvimrs::get_option_as("synmaxcol", buf.handle(), 0).unwrap_or(0);
-        let syntax_on: i64 =
-            if crate::nvimrs::get_var_as::<Object>("syntax_on").is_some() { 1 } else { 0 };
+        let syntax_on: i64 = if crate::nvimrs::get_var_as::<Object>("syntax_on").is_some() {
+            1
+        } else {
+            0
+        };
         let ts_lang = if gopts.ts_enabled {
             crate::treesitter::active_lang(state, gopts, buf.handle())
         } else {
@@ -173,9 +174,9 @@ impl<'a> Ctx<'a> {
 
     /// Compile a (possibly dynamically filled) vim pattern for scanning.
     fn compile_pat(&self, vim: &str) -> Option<CPat> {
-        let (re, checks, main) =
-            self.state
-                .compile_checked(vim, &self.translate_opts(false))?;
+        let (re, checks, main) = self
+            .state
+            .compile_checked(vim, &self.translate_opts(false))?;
         let fast_main = {
             let mut o = self.translate_opts(false);
             o.scan = true;
@@ -349,17 +350,20 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // check_skip determination (delim.vim:387-400)
     let cursor_skip = {
         let line = ctx.lines.get1(cur.lnum).unwrap_or("");
-        skip_at(ctx.state, &ctx.bc.skip, line, cur.lnum, cursorpos.min(line.len().max(1)), ctx.syntax_on)
+        skip_at(
+            ctx.state,
+            &ctx.bc.skip,
+            line,
+            cur.lnum,
+            cursorpos.min(line.len().max(1)),
+            ctx.syntax_on,
+        )
     };
     let noskips = ctx.gopts.delim_noskips;
     let check_skip = opts.check_skip.unwrap_or(match opts.direction {
         Direction::Current => {
             noskips >= 2
-                || (noskips >= 1
-                    && char_not_punct(
-                        ctx.lines.get1(cur.lnum).unwrap_or(""),
-                        cur0,
-                    ))
+                || (noskips >= 1 && char_not_punct(ctx.lines.get1(cur.lnum).unwrap_or(""), cur0))
         }
         _ => !cursor_skip || noskips >= 2,
     });
@@ -505,7 +509,14 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     // skip state recorded on the delim (delim.vim:486-496)
     let mut skip_state = false;
     if !check_skip && (ctx.synmaxcol == 0 || hit.cnum() as i64 <= ctx.synmaxcol) {
-        skip_state = skip_at(ctx.state, &ctx.bc.skip, line, hit.lnum, hit.cnum(), ctx.syntax_on);
+        skip_state = skip_at(
+            ctx.state,
+            &ctx.bc.skip,
+            line,
+            hit.lnum,
+            hit.cnum(),
+            ctx.syntax_on,
+        );
     }
 
     ctx.state.perf.toc("s:get_delim", "got_results");
@@ -521,14 +532,7 @@ pub fn get_delim(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
 /// next/prev: the position closest to the cursor in the scan direction.
 pub fn get_delim_multi(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
     let ts = ctx.ts_lang.as_ref().and_then(|lang| {
-        crate::treesitter::get_delim(
-            ctx.state,
-            ctx.gopts,
-            &ctx.buf,
-            ctx.buf.handle(),
-            lang,
-            opts,
-        )
+        crate::treesitter::get_delim(ctx.state, ctx.gopts, &ctx.buf, ctx.buf.handle(), lang, opts)
     });
     match opts.direction {
         Direction::Current => ts.or_else(|| get_delim(ctx, opts)),
@@ -554,13 +558,19 @@ pub fn get_delim_multi(ctx: &Ctx, opts: &GetDelimOpts) -> Option<Delim> {
 /// Skip-based rejection during next/prev scans (delim.vim:443-457).
 fn reject_by_skip(ctx: &Ctx, h: Hit, line: &str, check_skip: bool, forward: bool) -> bool {
     let noskips = ctx.gopts.delim_noskips;
-    let should_check = check_skip
-        || (noskips == 1 && char_not_punct(line, h.start0))
-        || noskips >= 2;
+    let should_check =
+        check_skip || (noskips == 1 && char_not_punct(line, h.start0)) || noskips >= 2;
     if !should_check {
         return false;
     }
-    if !skip_at(ctx.state, &ctx.bc.skip, line, h.lnum, h.cnum(), ctx.syntax_on) {
+    if !skip_at(
+        ctx.state,
+        &ctx.bc.skip,
+        line,
+        h.lnum,
+        h.cnum(),
+        ctx.syntax_on,
+    ) {
         return false;
     }
     // at buffer edges, accept anyway (delim.vim:448-449)
@@ -731,10 +741,7 @@ fn classify(ctx: &Ctx, line: &str, hit: Hit, opts: &GetDelimOpts, cur0: usize) -
         } else {
             if let Some(renu) = two.grp_renu.get(&word_id) {
                 for (&br, &to) in renu {
-                    let txt = caps
-                        .get(br as usize)
-                        .map(|m| m.as_str())
-                        .unwrap_or("");
+                    let txt = caps.get(br as usize).map(|m| m.as_str()).unwrap_or("");
                     groups.insert(to, txt.to_string());
                 }
             }
@@ -848,9 +855,7 @@ pub fn get_matching_raw(
     // ---- phase 1: find the counterpart ----
     let seed0 = delim.cnum.saturating_sub(1);
     let comb1_fast = match (&open_p.fast_main, &close_p.fast_main) {
-        (Some(o), Some(c)) => {
-            ctx.state.compile_fast(&format!("(?:{o})|(?:{c})"))
-        }
+        (Some(o), Some(c)) => ctx.state.compile_fast(&format!("(?:{o})|(?:{c})")),
         _ => None,
     };
     // the fancy comb is only needed when the DFA variant is unavailable;
@@ -945,9 +950,7 @@ pub fn get_matching_raw(
                             if !delim.groups.contains_key(&to) {
                                 if let Some(gm) = caps.get(from as usize) {
                                     if !gm.as_str().is_empty() {
-                                        delim
-                                            .groups
-                                            .insert(to, gm.as_str().to_string());
+                                        delim.groups.insert(to, gm.as_str().to_string());
                                     }
                                 }
                             }
@@ -975,20 +978,15 @@ pub fn get_matching_raw(
     let mut list: Vec<(String, usize, usize)> = Vec::new();
     let mids_vim = &lset.regexone.mid;
     if !mids_vim.is_empty() && !ctx.gopts.delim_nomids && !same {
-        let mut mids_filled =
-            fill_backrefs_vim(&remove_capture_groups(mids_vim), &delim.groups);
+        let mut mids_filled = fill_backrefs_vim(&remove_capture_groups(mids_vim), &delim.groups);
         if lset.regextwo.extra_info.mid_hlend && delim.highlighting {
             mids_filled = process_hlend(&mids_filled, -1);
         }
         if let Some(mids_p) = ctx.compile_pat(&mids_filled) {
-            let comb2_fast = match (
-                &open_p.fast_main,
-                &mids_p.fast_main,
-                &close_p.fast_main,
-            ) {
-                (Some(o), Some(mi), Some(c)) => ctx.state.compile_fast(&format!(
-                    "(?:{o})|(?:{mi})|(?:{c})"
-                )),
+            let comb2_fast = match (&open_p.fast_main, &mids_p.fast_main, &close_p.fast_main) {
+                (Some(o), Some(mi), Some(c)) => {
+                    ctx.state.compile_fast(&format!("(?:{o})|(?:{mi})|(?:{c})"))
+                }
                 _ => None,
             };
             let comb2_fancy = if comb2_fast.is_none() {
@@ -1078,10 +1076,7 @@ fn scan_same(
                 if lnum == seed_lnum && h.start0 >= seed0 {
                     continue;
                 }
-                return Some(Hit {
-                    lnum,
-                    ..*h
-                });
+                return Some(Hit { lnum, ..*h });
             }
         }
     }
@@ -1174,10 +1169,7 @@ where
                     Some(1) => depth += 1, // close
                     Some(0) => {
                         if depth == 0 {
-                            return Some(Hit {
-                                lnum,
-                                ..*h
-                            });
+                            return Some(Hit { lnum, ..*h });
                         }
                         depth -= 1;
                     }
@@ -1304,9 +1296,7 @@ where
                                 .flatten()
                                 .filter(|mm| mm.start() == h.start0)
                                 .map(|mm| line[mm.start()..mm.end()].to_string())
-                                .unwrap_or_else(|| {
-                                    line[h.start0..h.end0].to_string()
-                                });
+                                .unwrap_or_else(|| line[h.start0..h.end0].to_string());
                             out.push((extent, lnum, h.start0 + 1));
                         }
                     }
@@ -1326,13 +1316,7 @@ where
 /// Enumerate union hits on one line for Next/Prev scans: the DFA union
 /// (over-approximate positions, exact starts) plus the exotic fancy union,
 /// merged and deduplicated by start position.
-fn union_line_hits(
-    union: &Union,
-    lnum: usize,
-    line: &str,
-    from0: usize,
-    out: &mut Vec<Hit>,
-) {
+fn union_line_hits(union: &Union, lnum: usize, line: &str, from0: usize, out: &mut Vec<Hit>) {
     out.clear();
     if let Some(fast) = union.fast.as_ref() {
         let mut pos = bound_up(line, from0);
@@ -1523,11 +1507,7 @@ pub fn get_matching(ctx: &Ctx, seed: &Delim, opts: &MatchOpts) -> MatchingList {
         next[len - 2] = 0;
     }
 
-    MatchingList {
-        delims,
-        next,
-        prev,
-    }
+    MatchingList { delims, next, prev }
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,7 +1556,14 @@ pub fn get_surrounding(
 
     let cursor_skip = {
         let line = ctx.lines.get1(cursor.lnum).unwrap_or("");
-        skip_at(ctx.state, &ctx.bc.skip, line, cursor.lnum, cursor.cnum, ctx.syntax_on)
+        skip_at(
+            ctx.state,
+            &ctx.bc.skip,
+            line,
+            cursor.lnum,
+            cursor.cnum,
+            ctx.syntax_on,
+        )
     };
     let check_skip = if opts.check_skip {
         Some(true)
@@ -1689,11 +1676,7 @@ pub fn get_surrounding(
             let pos_val_try = close.pos().val() + close.end_offset() as i64;
             if pos_val_try >= pos_val_cursor {
                 if counter <= 1 {
-                    result = Some((
-                        ml.delims[seed_idx].clone(),
-                        close.clone(),
-                        ml,
-                    ));
+                    result = Some((ml.delims[seed_idx].clone(), close.clone(), ml));
                     break;
                 }
                 counter -= 1;
