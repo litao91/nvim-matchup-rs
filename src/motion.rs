@@ -74,19 +74,17 @@ fn read_vars(ctx: &Ctx) -> Vars {
     use crate::nvimrs::{call_fn0_as, get_option_as, get_vvar_as};
     let count = get_vvar_as::<i64>("count").unwrap_or(0);
     let count1 = get_vvar_as::<i64>("count1").unwrap_or(0).max(1);
-    let operator_v = get_vvar_as::<String>("operator").unwrap_or_default();
     let register = get_vvar_as::<String>("register").unwrap_or_default();
     let selection = get_option_as::<String>("selection", 0, 0).unwrap_or_default();
     let visualmode = call_fn0_as::<String>("visualmode").unwrap_or_default();
     let foldopen = get_option_as::<String>("foldopen", 0, 0).unwrap_or_default();
     let startofline = get_option_as::<bool>("startofline", 0, 0).unwrap_or(false);
-    // during the op() re-feed, v:operator may be cleared; use the stash
-    let stashed = ctx.state.op_operator.borrow().clone();
-    let operator = if stashed.is_empty() {
-        operator_v
-    } else {
-        stashed
-    };
+    // v:operator is sticky: it keeps the last operator until another one runs,
+    // so a stale "g@" from any operatorfunc-based operator (mini.surround, gq)
+    // would make plain normal-mode motions look operator-pending. Only the
+    // stash op_motion sets for the duration of the re-feed counts, matching
+    // upstream's script-local s:v_operator (motion.vim:14-21).
+    let operator = ctx.state.op_operator.borrow().clone();
     Vars {
         count,
         count1,
