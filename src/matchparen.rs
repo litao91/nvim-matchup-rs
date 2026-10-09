@@ -610,9 +610,7 @@ pub fn clear(ctx: &Ctx) {
                 Object::from(old.as_str()),
             ]),
         );
-        let _ = api::command(
-            "if exists('#User#MatchupOffscreenLeave') | doautocmd <nomodeline> User MatchupOffscreenLeave | endif",
-        );
+        nvimrs::exec_user_autocmd("MatchupOffscreenLeave");
     }
 }
 
@@ -854,9 +852,7 @@ fn do_offscreen_statusline(ctx: &Ctx, ml: &MatchingList, offscreen: &Delim, manu
                 Object::from(sl.as_str()),
             ]),
         );
-        let _ = api::command(
-            "if exists('#User#MatchupOffscreenEnter') | doautocmd <nomodeline> User MatchupOffscreenEnter | endif",
-        );
+        nvimrs::exec_user_autocmd("MatchupOffscreenEnter");
     }
 }
 

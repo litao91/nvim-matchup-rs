@@ -21,7 +21,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 
 use nvim_oxi::conversion::FromObject;
-use nvim_oxi::{Array, Object};
+use nvim_oxi::{Array, Dictionary, Object};
 
 /// `LUA_INTERNAL_CALL` = `(1<<63) + 1` (defs.h: INTERNAL_CALL_MASK, VIML/LUA).
 const LUA_INTERNAL_CALL: u64 = (1u64 << 63) + 1;
@@ -128,6 +128,125 @@ struct KeyDictEchoOpts {
     data: CArray, // Dict = kvec(KeyValuePair); zeroed = empty, never read (is_set=0)
 }
 
+/// `KeyDict_exec_autocmds` (keysets_defs.h:289-297), field order = memory order.
+#[repr(C)]
+struct KeyDictExecAutocmds {
+    is_set: u64,
+    buffer: i32,     // Buffer (deprecated)
+    buf: i32,        // Buffer
+    group: Object,   // Union(Integer, String)
+    modeline: bool,
+    pattern: Object, // Union(String, ArrayOf(String))
+    data: Object,
+}
+const OPTIDX_EXEC_AUTOCMDS_PATTERN: u64 = 5;
+const OPTIDX_EXEC_AUTOCMDS_MODELINE: u64 = 6;
+
+/// `KeyDict_highlight_cterm` (keysets_defs.h:222-239). Empirically 24 bytes:
+/// the generated keyset carries a leading `OptionalKeys is_set` even though the
+/// hand-written struct lists only the 16 bools (verified by the offset asserts
+/// below + runtime link behaviour).
+#[repr(C)]
+struct KeyDictHighlightCterm {
+    is_set: u64,
+    bold: bool,
+    standout: bool,
+    strikethrough: bool,
+    underline: bool,
+    undercurl: bool,
+    underdouble: bool,
+    underdotted: bool,
+    underdashed: bool,
+    italic: bool,
+    reverse: bool,
+    altfont: bool,
+    dim: bool,
+    blink: bool,
+    conceal: bool,
+    overline: bool,
+    nocombine: bool,
+}
+
+/// `KeyDict_highlight` (keysets_defs.h:182-220), field order = memory order.
+/// `Union(Integer, String)` fields are nvim `Object`; `HLGroupID` is `Integer`.
+#[repr(C)]
+struct KeyDictHighlight {
+    is_set: u64,
+    altfont: bool,
+    blink: bool,
+    bold: bool,
+    conceal: bool,
+    dim: bool,
+    italic: bool,
+    nocombine: bool,
+    overline: bool,
+    reverse: bool,
+    standout: bool,
+    strikethrough: bool,
+    undercurl: bool,
+    underdashed: bool,
+    underdotted: bool,
+    underdouble: bool,
+    underline: bool,
+    default_: bool,
+    cterm: KeyDictHighlightCterm,
+    foreground: Object,
+    fg: Object,
+    background: Object,
+    bg: Object,
+    ctermfg: Object,
+    ctermbg: Object,
+    special: Object,
+    sp: Object,
+    link: i64, // HLGroupID
+    link_global: i64,
+    fallback: bool,
+    blend: i64,
+    fg_indexed: bool,
+    bg_indexed: bool,
+    force: bool,
+    update: bool,
+    url: CStr,
+    font: CStr,
+}
+const OPTIDX_HL_LINK: u64 = 8;
+const OPTIDX_HL_DEFAULT: u64 = 16;
+
+// Compile-time layout guards: if the nvim keyset ever drifts (or Object/CStr
+// are not the assumed size), these fail the build instead of silently misreading
+// the struct at runtime (the failure mode that broke oxi's create_autocmd).
+const _: () = assert!(std::mem::size_of::<Object>() == 32);
+const _: () = assert!(std::mem::size_of::<CStr>() == 16);
+const _: () = assert!(std::mem::size_of::<KeyDictHighlightCterm>() == 24);
+const _: () = assert!(std::mem::size_of::<KeyDictHighlight>() == 384);
+const _: () = assert!(std::mem::offset_of!(KeyDictHighlight, default_) == 24);
+const _: () = assert!(std::mem::offset_of!(KeyDictHighlight, cterm) == 32);
+const _: () = assert!(std::mem::offset_of!(KeyDictHighlight, link) == 312);
+const _: () = assert!(std::mem::offset_of!(KeyDictHighlight, url) == 352);
+
+/// `KeyDict_user_command` (keysets_defs.h:99-113), field order = memory order.
+#[repr(C)]
+struct KeyDictUserCommand {
+    is_set: u64,
+    addr: Object,
+    bang: bool,
+    bar: bool,
+    complete: Object,
+    count: Object,
+    desc: Object,
+    force: bool,
+    keepscript: bool,
+    nargs: Object,
+    preview: Object,
+    range: Object,
+    register_: bool,
+}
+const OPTIDX_UCMD_DESC: u64 = 4;
+const OPTIDX_UCMD_FORCE: u64 = 6;
+const _: () = assert!(std::mem::size_of::<KeyDictUserCommand>() == 256);
+const _: () = assert!(std::mem::offset_of!(KeyDictUserCommand, desc) == 112);
+const _: () = assert!(std::mem::offset_of!(KeyDictUserCommand, force) == 144);
+
 unsafe extern "C" {
     fn nvim_eval(expr: CStr, arena: *mut c_void, err: *mut CError) -> Object;
     fn nvim_call_function(
@@ -150,6 +269,28 @@ unsafe extern "C" {
         arena: *mut c_void,
         err: *mut CError,
     ) -> i64;
+    fn nvim_exec_autocmds(
+        event: Object,
+        opts: *const KeyDictExecAutocmds,
+        arena: *mut c_void,
+        err: *mut CError,
+    );
+    fn nvim_get_hl_id_by_name(name: CStr, err: *mut CError) -> i64;
+    fn nvim_set_hl(
+        channel_id: u64,
+        ns_id: i64,
+        name: CStr,
+        val: *const KeyDictHighlight,
+        err: *mut CError,
+    );
+    fn nvim_create_user_command(
+        channel_id: u64,
+        name: CStr,
+        cmd: Object,
+        opts: *const KeyDictUserCommand,
+        err: *mut CError,
+    );
+    fn nvim_del_user_command(name: CStr, err: *mut CError);
     fn nvim_get_option_value(
         name: CStr,
         opts: *const KeyDictOption,
@@ -367,4 +508,86 @@ pub fn create_autocmd_cmd(events: &[&str], group: i32, pattern: &str, command: &
     let id =
         unsafe { nvim_create_autocmd(LUA_INTERNAL_CALL, event, &opts, ptr::null_mut(), &mut err) };
     !err.is_err() && id > 0
+}
+
+/// Fire a `User {name}` autocmd natively (`nvim_exec_autocmds`), a graceful
+/// no-op when nothing is registered. Replaces the vimscript
+/// `if exists('#User#X') | doautocmd <nomodeline> User X | endif`.
+pub fn exec_user_autocmd(name: &str) {
+    let event = Object::from("User");
+    let mut opts: KeyDictExecAutocmds = unsafe { std::mem::zeroed() };
+    opts.pattern = Object::from(name.to_string());
+    opts.is_set |= 1 << OPTIDX_EXEC_AUTOCMDS_PATTERN;
+    opts.modeline = false; // <nomodeline>
+    opts.is_set |= 1 << OPTIDX_EXEC_AUTOCMDS_MODELINE;
+    let mut err = CError::new();
+    unsafe { nvim_exec_autocmds(event, &opts, ptr::null_mut(), &mut err) };
+}
+
+/// Link highlight group `name` to `target` in the global namespace, without
+/// overriding an existing definition - the native `nvim_set_hl` equivalent of
+/// `hi def link {name} {target}`. `link` takes an HLGroupID, so `target` is
+/// resolved by name first.
+pub fn set_hl_link(name: &str, target: &str) {
+    let (_tguard, ctarget) = match cstr(target) {
+        Some(x) => x,
+        None => return,
+    };
+    let mut err = CError::new();
+    let id = unsafe { nvim_get_hl_id_by_name(ctarget, &mut err) };
+    if err.is_err() {
+        return;
+    }
+    let (_nguard, cname) = match cstr(name) {
+        Some(x) => x,
+        None => return,
+    };
+    let mut val: KeyDictHighlight = unsafe { std::mem::zeroed() };
+    val.link = id;
+    val.is_set |= 1 << OPTIDX_HL_LINK;
+    val.default_ = true;
+    val.is_set |= 1 << OPTIDX_HL_DEFAULT;
+    let mut err = CError::new();
+    unsafe { nvim_set_hl(LUA_INTERNAL_CALL, 0, cname, &val, &mut err) };
+}
+
+/// Define a user command whose handler is a native Rust callback (a LuaRef
+/// packed as the `Union(String, LuaRef)` cmd), via the correctly-laid-out
+/// `KeyDict_user_command`. `force = true` mirrors `command!`. The callback
+/// receives the command-args table (ignored by our no-arg commands).
+pub fn create_user_command_cb<F>(name: &str, desc: &str, f: F) -> bool
+where
+    F: Fn(Dictionary) + 'static,
+{
+    use nvim_oxi::Function;
+    let func: Function<Dictionary, ()> =
+        Function::from_fn(move |args| -> nvim_oxi::Result<()> {
+            f(args);
+            Ok(())
+        });
+    let cmd = Object::from(func); // tagged LuaRef object
+
+    let (_ng, cname) = match cstr(name) {
+        Some(x) => x,
+        None => return false,
+    };
+    let mut opts: KeyDictUserCommand = unsafe { std::mem::zeroed() };
+    opts.force = true;
+    opts.is_set |= 1 << OPTIDX_UCMD_FORCE;
+    opts.desc = Object::from(desc.to_string());
+    opts.is_set |= 1 << OPTIDX_UCMD_DESC;
+    let mut err = CError::new();
+    unsafe { nvim_create_user_command(LUA_INTERNAL_CALL, cname, cmd, &opts, &mut err) };
+    !err.is_err()
+}
+
+/// Delete a user command natively (`nvim_del_user_command`). A missing command
+/// is not an error for our purposes (mirrors `silent! delcommand`).
+pub fn del_user_command(name: &str) {
+    let (_g, cname) = match cstr(name) {
+        Some(x) => x,
+        None => return,
+    };
+    let mut err = CError::new();
+    unsafe { nvim_del_user_command(cname, &mut err) };
 }

@@ -152,7 +152,7 @@ pub(crate) fn with_ctx_for<R>(
 
 /// One-time activation, guarded by Rust state (`State.activated`): highlight
 /// groups, neutralize matchit / the bundled pi_paren, and define the user
-/// commands. All globals it touches belong to *other* plugins (matchit,
+/// commands. The globals it touches belong to *other* plugins (matchit,
 /// pi_paren) and are set from Rust; matchup-rs keeps no state in vimscript.
 fn activate(state: &SharedState) {
     if state.is_activated() {
@@ -160,14 +160,18 @@ fn activate(state: &SharedState) {
     }
     state.set_activated();
 
-    // highlight groups (same defaults as vim-matchup)
-    let _ = api::command("hi def link MatchParenCur MatchParen");
-    let _ = api::command("hi def link MatchWord MatchParen");
-    let _ = api::command("hi def link MatchBackground ColorColumn");
+    // highlight group links (native nvim_set_hl with `default`, so an existing
+    // user definition is not overridden - the `hi def link` equivalent)
+    nvimrs::set_hl_link("MatchParenCur", "MatchParen");
+    nvimrs::set_hl_link("MatchWord", "MatchParen");
+    nvimrs::set_hl_link("MatchBackground", "ColorColumn");
 
-    // disable matchit and its bundled mappings
+    // Disable matchit and its bundled mappings. nvim ships matchit loaded (%
+    // mapped to <Plug>(MatchitNormalForward)); clear it so matchup's own
+    // motion/text-object maps can claim %/[%/]%/a% (motion::setup only maps an
+    // lhs that is currently free).
     let _ = api::set_var("loaded_matchit", 1);
-    let _ = api::command("silent! delcommand MatchDebug");
+    nvimrs::del_user_command("MatchDebug");
     for m in ["%", "[%", "]%", "a%", "g%"] {
         let _ = api::command(&format!("silent! unmap {m}"));
     }
@@ -178,19 +182,55 @@ fn activate(state: &SharedState) {
     let _ = api::command("silent! au! matchparen");
     let _ = api::set_var("loaded_matchparen", 1);
 
-    // user commands call the Rust module directly (no vimscript state)
-    let _ = api::command(
-        "command! NoMatchParen lua local m=require('matchup_rs'); m.set_matchparen_enabled(false); m.clear()",
-    );
-    let _ = api::command(
-        "command! DoMatchParen lua local m=require('matchup_rs'); m.set_matchparen_enabled(true); m.clear(); m.update()",
-    );
-    let _ = api::command(
-        "command! MatchupReload lua local m=require('matchup_rs'); m.reload(); m.update()",
-    );
-    let _ = api::command(
-        "command! MatchupShowTimes lua require('matchup_rs').show_times()",
-    );
+    // user commands via native nvim_create_user_command with Rust callbacks
+    // (no `command!` vimscript strings, no lua bodies).
+    let s = Rc::clone(state);
+    nvimrs::create_user_command_cb("NoMatchParen", "Disable matchup highlighting", move |_| {
+        guard("cmd_NoMatchParen", || {
+            s.set_matchparen_enabled(false);
+            with_ctx(&s, |ctx| matchparen::clear(ctx));
+        });
+    });
+    let s = Rc::clone(state);
+    nvimrs::create_user_command_cb("DoMatchParen", "Enable matchup highlighting", move |_| {
+        guard("cmd_DoMatchParen", || {
+            s.set_matchparen_enabled(true);
+            with_ctx(&s, |ctx| matchparen::clear(ctx));
+            with_ctx(&s, |ctx| matchparen::highlight(ctx, true, false));
+        });
+    });
+    let s = Rc::clone(state);
+    nvimrs::create_user_command_cb("MatchupReload", "Reload matchup per-buffer state", move |_| {
+        guard("cmd_MatchupReload", || {
+            s.reload();
+            with_ctx(&s, |ctx| matchparen::highlight(ctx, true, false));
+        });
+    });
+    let s = Rc::clone(state);
+    nvimrs::create_user_command_cb("MatchupShowTimes", "Show matchup perf timings", move |_| {
+        guard("cmd_MatchupShowTimes", || emit_times(&s));
+    });
+}
+
+/// Format and echo the perf timings (shared by the `show_times` export and the
+/// `:MatchupShowTimes` command callback).
+fn emit_times(state: &State) {
+    let times = state.perf.times.borrow().clone();
+    let mut keys: Vec<&String> = times.keys().collect();
+    keys.sort();
+    let mut out = String::from("matchup-rs times (emavg / last / max):\n");
+    for k in keys {
+        let e = &times[k];
+        out.push_str(&format!(
+            "  {:<40} {:>8.3}ms {:>8.3}ms {:>8.3}ms\n",
+            k,
+            e.emavg * 1000.0,
+            e.last * 1000.0,
+            e.maximum * 1000.0
+        ));
+    }
+    // native nvim_echo (oxi's api::echo is ABI-broken on 0.13-dev).
+    nvimrs::echo(&out);
 }
 
 #[nvim_oxi::plugin]
@@ -372,22 +412,7 @@ fn matchup_rs() -> Result<Dictionary> {
 
     let s = Rc::clone(&state);
     let show_times: Function<(), ()> = Function::from_fn(move |()| -> nvim_oxi::Result<()> {
-        let times = s.perf.times.borrow().clone();
-        let mut keys: Vec<&String> = times.keys().collect();
-        keys.sort();
-        let mut out = String::from("matchup-rs times (emavg / last / max):\n");
-        for k in keys {
-            let e = &times[k];
-            out.push_str(&format!(
-                "  {:<40} {:>8.3}ms {:>8.3}ms {:>8.3}ms\n",
-                k,
-                e.emavg * 1000.0,
-                e.last * 1000.0,
-                e.maximum * 1000.0
-            ));
-        }
-        // native nvim_echo (oxi's api::echo is ABI-broken on 0.13-dev).
-        nvimrs::echo(&out);
+        guard("show_times", || emit_times(&s));
         Ok(())
     });
 
