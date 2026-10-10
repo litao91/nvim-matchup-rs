@@ -173,7 +173,7 @@ impl<'a> Ctx<'a> {
             0
         };
         let ts_lang = if gopts.ts_enabled {
-            crate::treesitter::active_lang(state, gopts, buf.handle())
+            crate::treesitter::active_lang(state, gopts, &buf)
         } else {
             None
         };

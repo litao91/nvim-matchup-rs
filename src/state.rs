@@ -148,6 +148,11 @@ pub struct GOpts {
     pub ts_enabled: bool,
     pub ts_disabled: Vec<String>,
     pub ts_stopline: usize,
+    /// Fall back to the classic engine for buffers with more than this many
+    /// lines (0 = no limit). Parsing a large file can exceed the parser's
+    /// timeout budget, and a timed-out parse is not cached, so every operation
+    /// would re-pay the full parse.
+    pub ts_max_lines: usize,
     pub ts_enable_quotes: bool,
     pub ts_include_match_words: bool,
     pub ts_disable_virtual_text: bool,
@@ -194,6 +199,7 @@ impl Default for GOpts {
             ts_enabled: false,
             ts_disabled: Vec::new(),
             ts_stopline: 400,
+            ts_max_lines: 2000,
             ts_enable_quotes: true,
             ts_include_match_words: false,
             ts_disable_virtual_text: false,
@@ -393,6 +399,9 @@ impl GOpts {
             }
             if let Some(v) = d.get("stopline").and_then(obj_i64) {
                 g.ts_stopline = v.max(0) as usize;
+            }
+            if let Some(v) = d.get("max_lines").and_then(obj_i64) {
+                g.ts_max_lines = v.max(0) as usize;
             }
             if let Some(v) = d.get("enable_quotes").and_then(obj_bool) {
                 g.ts_enable_quotes = v;

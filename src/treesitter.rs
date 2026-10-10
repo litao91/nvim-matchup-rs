@@ -803,10 +803,17 @@ fn containing_scope<'t>(
 
 /// Port of M.is_enabled + language resolution. `lang` = filetype for now
 /// (nvim's get_lang only diverges for explicit registrations).
-pub fn active_lang(state: &State, gopts: &GOpts, bufnr: i32) -> Option<String> {
+pub fn active_lang(state: &State, gopts: &GOpts, buf: &Buffer) -> Option<String> {
     if !gopts.ts_enabled {
         return None;
     }
+    // Oversized-buffer guard. A parse that exceeds the parser's timeout budget
+    // yields None and is never cached, so every operation would re-attempt it
+    // and re-pay the whole budget; the classic engine stays usable there.
+    if gopts.ts_max_lines > 0 && buf.line_count().unwrap_or(0) > gopts.ts_max_lines {
+        return None;
+    }
+    let bufnr = buf.handle();
     let ft: String = crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     if ft.is_empty() {
         return None;

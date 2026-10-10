@@ -136,7 +136,7 @@ pub(crate) fn with_ctx_for<R>(
         return None;
     }
     let ts_words = if gopts.ts_enabled {
-        match crate::treesitter::active_lang(state, &gopts, buf.handle()) {
+        match crate::treesitter::active_lang(state, &gopts, buf) {
             Some(_) if gopts.ts_include_match_words => state::TsWords::Filter,
             Some(_) => state::TsWords::NoWords,
             None => state::TsWords::None,

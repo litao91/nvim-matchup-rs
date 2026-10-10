@@ -98,6 +98,8 @@ require('matchup_rs').setup({
     enable = true,                       -- default follows has('nvim-0.11.2')
     disabled = {}, stopline = 400, enable_quotes = true,
     include_match_words = false, disable_virtual_text = false,
+    max_lines = 2000,                    -- use the classic engine instead for
+                                         -- buffers over this many lines (0 = off)
   },
 })
 ```
@@ -155,6 +157,13 @@ buffers): **~1.3-2.7x** faster on `get_current` / `get_matching` and **~3.7-4.6x
 cache lifted highlight the most, and lua is no longer at parity. The cold first call (which includes the full parse) is
 mixed - rust 59-154 ms vs orig 55-95 ms - since this port parses in Rust userspace via the `tree-sitter` crate while nvim
 reuses its incremental C-native parse; warm ops dominate interactive use.
+
+The treesitter engine's cost scales with the whole buffer rather than with the match: every operation needs a parsed
+tree, and a parse that exceeds the parser's 250 ms budget yields no tree and is _not_ cached, so each subsequent
+operation retries it from scratch. On a 12k-line C++ file the cold parse is ~270 ms and the cached steady state ~9 ms
+per operation (the classic engine answers the same query in ~0.1 ms); at 24k lines the parse no longer fits the budget,
+and every cursor move then pays the full ~250 ms timeout plus the classic fallback. `treesitter.max_lines` (default
+2000) therefore falls back to the classic engine on oversized buffers; set it to `0` to keep treesitter everywhere.
 
 ## Correctness
 
