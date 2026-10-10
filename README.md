@@ -134,24 +134,27 @@ Rust.
 [bench/RESULTS.md](bench/RESULTS.md); headlines below are medians, geometric mean over 2k/10k/50k-line synthetic
 vim/C/lua files plus a real 50k-line vimscript corpus.
 
-**Classic engine** - dramatically faster on the expensive operations, at parity on trivial ones. The overall geometric
-mean is methodology/machine-sensitive (the original's large-file cost grows with iteration count as its delim memo
-thrashes, so a low-iteration run measures a smaller ratio); across runs it lands ~3-7x. The robust per-operation medians
-from a clean same-session run (overall geomean **2.8x**):
+**Classic engine** - faster across the board. Since the per-buffer line-snapshot cache, the trivial ops are no longer at
+parity (they used to refetch the whole buffer on every call). The overall geometric mean is methodology/machine-sensitive
+(the original's large-file cost grows with iteration count as its delim memo thrashes, so a low-iteration run measures a
+smaller ratio). The robust per-operation medians from a clean same-session run (overall geomean **7.2x**):
 
 - `get_surrounding` from deep inside a large file: **~25x** faster (geomean; the original's backward walk takes 0.1-94
   _seconds_ per call on 50k-line files, while the Rust engine stays in the low milliseconds except on the real 50k-line
-  corpus, where both are seconds-scale)
+  corpus, where both are seconds-scale). On the 50k _synthetic_ fixtures the target's surrounding block lies beyond
+  `delim_stopline`, so both engines return not-found there and the ratio measures bounded backward-walk speed, not a
+  found-pair speedup (verified: rust `nil`, original empty) - see [bench/RESULTS.md](bench/RESULTS.md)
 - `[%`-style motion: **~11x** faster (the original pins its 750 ms timeout on large files; the Rust engine finishes in
   ~1-20 ms)
-- full-file `get_matching`: geomean ~1x, ~0.6-2.3x by filetype - vim's regex-heavy `match_words` benefits, while
-  single-character C/lua `&matchpairs` are already fast in vim's C search loop (trivial lookups land at parity or
-  slightly under)
-- highlight cycle: at parity (~0.8-1.1x; ~1-3 ms both sides)
+- full-file `get_matching`: **~5-6x** faster (geomean; `matching_outer` 5.2x, `matching_middle` 5.8x) - was ~1x before
+  the snapshot cache
+- highlight cycle: **~2.4x** faster (geomean) - was at parity (~0.8-1.1x) before the cache
 
-**Treesitter engine** - pure-Rust port vs nvim's native `vim.treesitter`: **~1.3-2.1x** faster on vim and C buffers
-(highlight up to 2.0x) and at parity on lua (~0.8-1.2x), despite nvim's treesitter being C-native while this port parses
-entirely in Rust userspace via the `tree-sitter` crate.
+**Treesitter engine** - pure-Rust port vs nvim's native `vim.treesitter` (fresh process per engine+file, 10k vim/C/lua
+buffers): **~1.3-2.7x** faster on `get_current` / `get_matching` and **~3.7-4.6x** on the highlight cycle - the snapshot
+cache lifted highlight the most, and lua is no longer at parity. The cold first call (which includes the full parse) is
+mixed - rust 59-154 ms vs orig 55-95 ms - since this port parses in Rust userspace via the `tree-sitter` crate while nvim
+reuses its incremental C-native parse; warm ops dominate interactive use.
 
 ## Correctness
 
