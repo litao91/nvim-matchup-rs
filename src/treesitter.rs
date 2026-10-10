@@ -101,6 +101,13 @@ pub struct TsState {
     next_id: u64,
     /// (bufnr) -> (filetype, verdict); invalidated when the filetype changes
     verdicts: HashMap<i32, (String, Option<String>)>,
+    /// Buffers whose last parse failed (in practice, exceeded the timeout
+    /// budget). A failed parse yields no tree, so without this latch every
+    /// operation would re-attempt it and re-pay the whole 250 ms - and
+    /// `get_surrounding` alone calls `ensure_tree` once per step of its outward
+    /// walk, all within a single operation. Sticky until `invalidate`
+    /// (`MatchupReload` / `BufDelete`), mirroring `lang_failed` / `query_failed`.
+    parse_failed: HashSet<i32>,
 }
 
 impl TsState {
@@ -380,13 +387,11 @@ fn ensure_tree(state: &State, bufnr: i32, buf: &Buffer) -> Option<(Tree, String,
                 ));
             }
         }
+        if ts.parse_failed.contains(&bufnr) {
+            return None;
+        }
     }
     let (text, line_starts, tick) = fetch_text(buf)?;
-    let lang = {
-        let ts = state.ts.borrow();
-        ts.trees.get(&bufnr).map(|_| ())
-    };
-    let _ = lang;
     // language for this buffer
     let ft: String = crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     let language = language(state, &ft)?;
@@ -403,16 +408,25 @@ fn ensure_tree(state: &State, bufnr: i32, buf: &Buffer) -> Option<(Tree, String,
         .trees
         .get(&bufnr)
         .map(|bt| (bt.tree.clone(), bt.text.clone(), bt.lang.clone()));
-    let tree = match old {
+    let parsed = match old {
         Some((mut old_tree, ref old_text, ref old_lang)) if *old_lang == ft => {
             if let Some(edit) = diff_edit(old_text, &text) {
                 old_tree.edit(&edit);
             }
-            parser.parse(text.as_bytes(), Some(&old_tree))?
+            parser.parse(text.as_bytes(), Some(&old_tree))
         }
-        _ => parser.parse(text.as_bytes(), None)?,
+        _ => parser.parse(text.as_bytes(), None),
     };
-    state.ts.borrow_mut().trees.insert(
+    let tree = match parsed {
+        Some(t) => t,
+        None => {
+            state.ts.borrow_mut().parse_failed.insert(bufnr);
+            return None;
+        }
+    };
+    let mut ts = state.ts.borrow_mut();
+    ts.parse_failed.remove(&bufnr);
+    ts.trees.insert(
         bufnr,
         BufTree {
             tick,
@@ -807,13 +821,21 @@ pub fn active_lang(state: &State, gopts: &GOpts, buf: &Buffer) -> Option<String>
     if !gopts.ts_enabled {
         return None;
     }
-    // Oversized-buffer guard. A parse that exceeds the parser's timeout budget
-    // yields None and is never cached, so every operation would re-attempt it
-    // and re-pay the whole budget; the classic engine stays usable there.
+    // Oversized-buffer guard: parsing a big file can exceed the parser's
+    // timeout budget, and the classic engine is orders of cheaper there.
     if gopts.ts_max_lines > 0 && buf.line_count().unwrap_or(0) > gopts.ts_max_lines {
         return None;
     }
     let bufnr = buf.handle();
+    // Report a buffer whose parse failed as inactive, not merely unparseable.
+    // The caller derives TsWords from this verdict, and a Some here blanks
+    // b:match_words - which would leave the classic fallback that runs when the
+    // tree is missing with &matchpairs only, silently losing every keyword
+    // delimiter. Checked before the verdict cache so it takes effect on the
+    // very next operation after the failure.
+    if state.ts.borrow().parse_failed.contains(&bufnr) {
+        return None;
+    }
     let ft: String = crate::nvimrs::get_option_as("filetype", bufnr, 0).unwrap_or_default();
     if ft.is_empty() {
         return None;
@@ -1126,10 +1148,12 @@ pub fn invalidate(state: &State, bufnr: Option<i32>) {
         Some(b) => {
             ts.trees.remove(&b);
             ts.verdicts.remove(&b);
+            ts.parse_failed.remove(&b);
         }
         None => {
             ts.trees.clear();
             ts.verdicts.clear();
+            ts.parse_failed.clear();
             ts.delim_cache.clear();
             ts.cache_order.clear();
             ts.queries.clear();

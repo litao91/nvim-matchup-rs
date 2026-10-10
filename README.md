@@ -159,11 +159,17 @@ mixed - rust 59-154 ms vs orig 55-95 ms - since this port parses in Rust userspa
 reuses its incremental C-native parse; warm ops dominate interactive use.
 
 The treesitter engine's cost scales with the whole buffer rather than with the match: every operation needs a parsed
-tree, and a parse that exceeds the parser's 250 ms budget yields no tree and is _not_ cached, so each subsequent
-operation retries it from scratch. On a 12k-line C++ file the cold parse is ~270 ms and the cached steady state ~9 ms
-per operation (the classic engine answers the same query in ~0.1 ms); at 24k lines the parse no longer fits the budget,
-and every cursor move then pays the full ~250 ms timeout plus the classic fallback. `treesitter.max_lines` (default
-2000) therefore falls back to the classic engine on oversized buffers; set it to `0` to keep treesitter everywhere.
+tree. On a 12k-line C++ file the cold parse is ~270 ms and the cached steady state ~5-9 ms per operation, where the
+classic engine answers the same query in ~0.1 ms. `treesitter.max_lines` (default 2000) therefore falls back to the
+classic engine on oversized buffers; set it to `0` to keep treesitter everywhere.
+
+Parsing is also bounded by a 250 ms budget (`set_timeout_micros`), and a buffer that exceeds it gets no tree at all.
+Such a failure is latched per buffer: further operations fall back to the classic engine immediately instead of
+re-attempting the parse and re-paying the timeout on every cursor move and every keystroke. The latch also reports the
+buffer as treesitter-inactive, so the classic fallback keeps its full `b:match_words` rather than the treesitter-blanked
+set - without that, a timed-out parse would silently reduce matching to `&matchpairs` and lose every keyword delimiter.
+`:MatchupReload` clears the latch and retries. Note the fallback is only as good as the classic engine for that
+filetype: for C/C++, whose `b:match_words` is just `/*:*/`, a timed-out parse means braces and comments only.
 
 ## Correctness
 
