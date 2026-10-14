@@ -349,6 +349,16 @@ fn diff_edit(old: &str, new: &str) -> Option<InputEdit> {
         eold -= 1;
         enew -= 1;
     }
+    // Both walks compare raw bytes, so they can stop *inside* a multi-byte
+    // char: swapping '┐' for '│' leaves the common prefix ending at its third
+    // byte, and swapping '─' (E2 94 80) for '一' (E4 B8 80) leaves both suffix
+    // cursors mid-char. Snap outward to char boundaries - a mid-char offset
+    // panics on the slices below and would hand tree-sitter an inconsistent
+    // InputEdit. `start` may be floored against `old` because the common
+    // prefix is byte-identical in `new`, so it is a boundary in both.
+    let start = old.floor_char_boundary(start);
+    let eold = old.ceil_char_boundary(eold);
+    let enew = new.ceil_char_boundary(enew);
     // expand to line boundaries so points stay consistent
     let ls = old[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let start_position = point_of_lines(old, ls);
@@ -1165,4 +1175,55 @@ pub fn invalidate(state: &State, bufnr: Option<i32>) {
 #[allow(dead_code)]
 fn path_exists(p: &Path) -> bool {
     p.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diff_edit;
+
+    // Every byte offset handed back must sit on a char boundary, or the slices
+    // in diff_edit/point_of_lines panic and tree-sitter gets a corrupt edit.
+
+    #[test]
+    fn prefix_walk_snaps_to_char_boundaries() {
+        // '┐' (E2 94 90) vs '│' (E2 94 82): the walk stops on the third byte
+        let old = "```\n┌─a─┐\n```\n";
+        let new = "```\n┌─a─│\n```\n";
+        let e = diff_edit(old, new).expect("texts differ");
+        assert!(old.is_char_boundary(e.start_byte), "start={}", e.start_byte);
+        assert!(
+            old.is_char_boundary(e.old_end_byte),
+            "old_end={}",
+            e.old_end_byte
+        );
+        assert!(
+            new.is_char_boundary(e.new_end_byte),
+            "new_end={}",
+            e.new_end_byte
+        );
+    }
+
+    #[test]
+    fn suffix_walk_snaps_to_char_boundaries() {
+        // '─' (E2 94 80) and '一' (E4 B8 80) share their trailing byte, so the
+        // backwards walk stops inside both chars
+        let old = "x─";
+        let new = "x一";
+        let e = diff_edit(old, new).expect("texts differ");
+        assert!(
+            old.is_char_boundary(e.old_end_byte),
+            "old_end={}",
+            e.old_end_byte
+        );
+        assert!(
+            new.is_char_boundary(e.new_end_byte),
+            "new_end={}",
+            e.new_end_byte
+        );
+    }
+
+    #[test]
+    fn identical_text_is_no_edit() {
+        assert!(diff_edit("a─b", "a─b").is_none());
+    }
 }
