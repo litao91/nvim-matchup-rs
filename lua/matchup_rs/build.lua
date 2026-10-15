@@ -4,18 +4,21 @@
 --   :lua require('matchup_rs.build').build()                  -- always (re)build
 --   :lua require('matchup_rs.build').build({ profile = 'debug' })
 --   :lua require('matchup_rs.build').build({ touch = true })  -- WSL2/drvfs mtime
+--   :lua require('matchup_rs.build').build():wait()           -- block until done (headless)
 --   :lua require('matchup_rs.build').build_log()              -- open the build log
 --
--- Follows the blink.cmp fuzzy-build convention: an async `vim.system` cargo
--- run (non-blocking), progress notifications, and the compiler output captured
+-- Follows the blink.cmp fuzzy-build convention: an async cargo run
+-- (non-blocking), progress notifications, and the compiler output captured
 -- to a log file you can open with build_log(). Pure Lua - this does NOT depend
 -- on the compiled .so, so it can build it from scratch. cargo names the cdylib
 -- lib<name>.so / lib<name>.dylib on unix and <name>.dll on windows; nvim's
 -- package.cpath loads it as lua/matchup_rs.so (unix) or lua/matchup_rs.dll.
 --
--- The build is asynchronous: build() returns immediately and notifies on
--- completion. A running nvim that already require'd the native module keeps the
--- old code until restarted.
+-- The build runs in a `vim.async` task: build() returns the task immediately
+-- and notifies on completion, while the task suspends (without blocking the
+-- event loop) until cargo exits. Headless callers can block on the returned
+-- task with build():wait(). A running nvim that already require'd the native
+-- module keeps the old code until restarted.
 --
 -- opts:
 --   dir      repo root (default: derived from this file's path, else :pwd)
@@ -159,8 +162,20 @@ local function is_outdated(u, root, release)
 end
 
 --- Build the native module from source (asynchronous).
+---
+--- The build runs in a `vim.async` task: cargo is spawned with `vim.system`
+--- and the task suspends at `vim.async.pawait` until the process exits, so
+--- the event loop stays free while compiling. The task handle is returned;
+--- `build():wait()` blocks until the build finishes (useful headlessly) and
+--- inside another task you can `vim.async.await(task)` it.
 --- @param opts? { dir?: string, profile?: 'release'|'debug', touch?: boolean }
+--- @return vim.async.Task? task completes after the success/failure notification
 function M.build(opts)
+  if not (vim.async and vim.async.run and vim.async.pawait) then
+    notify(vim.log.levels.ERROR, 'build() requires the vim.async API (Neovim 0.13+)')
+    return
+  end
+
   opts = opts or {}
   local u = uv()
   local root = repo_root(opts)
@@ -183,34 +198,50 @@ function M.build(opts)
   args[#args + 1] = '--target-dir'
   args[#args + 1] = root .. s .. 'target'
 
-  local log = io.open(log_path(), 'w')
-  if log then
-    log:write('Working Directory: ' .. root .. '\n')
-    log:write('Command: ' .. table.concat(args, ' ') .. '\n\n---\n\n')
-    log:flush()
-  end
-
   notify(vim.log.levels.INFO, 'Building native module from source...')
 
-  vim.system(args, {
-    cwd = root,
-    text = true,
-    stdout = function(_, data)
+  local task = vim.async.run('matchup_rs.build', function()
+    local log = io.open(log_path(), 'w')
+    if log then
+      log:write('Working Directory: ' .. root .. '\n')
+      log:write('Command: ' .. table.concat(args, ' ') .. '\n\n---\n\n')
+      log:flush()
+    end
+
+    local function write_log(_, data)
       if log and data then
         log:write(data)
         log:flush()
       end
-    end,
-    stderr = function(_, data)
-      if log and data then
-        log:write(data)
-        log:flush()
-      end
-    end,
-  }, vim.schedule_wrap(function(res)
+    end
+
+    -- Suspend the task until cargo exits; the stdout/stderr callbacks keep
+    -- streaming compiler output into the log while it is parked (plain io,
+    -- safe in any context). vim.system fires on_exit from a libuv callback,
+    -- which is a fast-event context while Task:wait() pumps the loop, so hop
+    -- to the main loop before resuming: the task body calls vim.notify.
+    local ok, res = vim.async.pawait(function(done)
+      return vim.system(args, {
+        cwd = root,
+        text = true,
+        stdout = write_log,
+        stderr = write_log,
+      }, function(res)
+        vim.schedule(function()
+          done(res)
+        end)
+      end)
+    end)
+
     if log then
       log:close()
       log = nil
+    end
+
+    if not ok then
+      -- vim.system failed to start (e.g. cargo is not on PATH).
+      notify(vim.log.levels.ERROR, 'Failed to start cargo build: ' .. tostring(res))
+      return
     end
     if res.code ~= 0 then
       notify(vim.log.levels.ERROR,
@@ -223,7 +254,17 @@ function M.build(opts)
       return
     end
     notify(vim.log.levels.INFO, 'Successfully built native module (restart nvim to load it).')
-  end))
+  end)
+
+  -- A top-level task that fails is silent unless observed; report anything the
+  -- task body did not handle itself (known failures notify inside the body).
+  task:on_complete(function(err)
+    if err ~= nil then
+      notify(vim.log.levels.ERROR, 'Build task failed: ' .. tostring(err))
+    end
+  end)
+
+  return task
 end
 
 --- Ensure the native module is present and up to date: rebuild (async) when the

@@ -48,12 +48,13 @@ Build the native module from inside nvim with the Lua helper:
 or headlessly:
 
 ```sh
-nvim --headless "+lua require('matchup_rs.build').build()" +qa
+nvim --headless "+lua require('matchup_rs.build').build():wait()" +qa
 ```
 
-`build()` runs `cargo build --release` asynchronously (via `vim.system`, so it does not block nvim;
+`build()` runs `cargo build --release` in a `vim.async` task (spawned via `vim.system`, so it does not block nvim;
 `--manifest-path`/`--target-dir` leave your working directory untouched), notifies on completion, and captures compiler
-output to a log you can open with `require('matchup_rs.build').build_log()`. On success it picks the right artifact per
+output to a log you can open with `require('matchup_rs.build').build_log()`. It returns the task, so headless builds can
+block until it finishes with `build():wait()`. On success it picks the right artifact per
 platform (`libmatchup_rs.so` on Linux, `libmatchup_rs.dylib` on macOS, `matchup_rs.dll` on Windows) and atomically
 copies it to `lua/matchup_rs.so` (`.dll` on Windows) where `require('matchup_rs')` finds it. Because it is async, a
 running nvim loads the new module on the _next_ start. Options: `build({ profile = 'debug' })`,
