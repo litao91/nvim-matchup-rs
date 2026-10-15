@@ -11,13 +11,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nvim-oxi = { version = "0.6.0", features = ["neovim-0-11"] }
-fancy-regex = "0.16"
+fancy-regex = "0.19"
 regex = "1"
 once_cell = "1"
-tree-sitter = "0.25"
+tree-sitter = "0.27"
 tree-sitter-language = "0.1"
-libloading = "0.8"
-sha2 = "0.10"
+libloading = "0.9"
+sha2 = "0.11"
 
 [profile.release]
 lto = true

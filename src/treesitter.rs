@@ -12,14 +12,17 @@
 //! `tree_sitter::InputEdit`.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 use nvim_oxi::api::{self, Buffer};
 use nvim_oxi::conversion::FromObject;
 use tree_sitter::{
-    InputEdit, Language, Node, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+    InputEdit, Language, Node, ParseOptions, ParseState, Parser, Point, Query, QueryCursor,
+    StreamingIterator, Tree,
 };
 use tree_sitter_language::LanguageFn;
 
@@ -33,6 +36,9 @@ pub const TS_SET: usize = usize::MAX - 1;
 
 /// Cap for the delim info cache (internal.lua: `lru.new(150)`).
 const DELIM_CACHE_CAP: usize = 150;
+
+/// Wall-clock bound on a single parse before it is abandoned.
+const PARSE_TIMEOUT: Duration = Duration::from_micros(250_000);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -407,10 +413,6 @@ fn ensure_tree(state: &State, bufnr: i32, buf: &Buffer) -> Option<(Tree, String,
     let language = language(state, &ft)?;
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
-    // bound worst-case parse time; a timed-out parse yields None and the
-    // engine falls back to classic matching
-    #[allow(deprecated)]
-    parser.set_timeout_micros(250_000);
 
     let old = state
         .ts
@@ -418,15 +420,32 @@ fn ensure_tree(state: &State, bufnr: i32, buf: &Buffer) -> Option<(Tree, String,
         .trees
         .get(&bufnr)
         .map(|bt| (bt.tree.clone(), bt.text.clone(), bt.lang.clone()));
-    let parsed = match old {
+    let old_tree = match old {
         Some((mut old_tree, ref old_text, ref old_lang)) if *old_lang == ft => {
             if let Some(edit) = diff_edit(old_text, &text) {
                 old_tree.edit(&edit);
             }
-            parser.parse(text.as_bytes(), Some(&old_tree))
+            Some(old_tree)
         }
-        _ => parser.parse(text.as_bytes(), None),
+        _ => None,
     };
+
+    // bound worst-case parse time; a timed-out parse yields None and the
+    // engine falls back to classic matching
+    let start = Instant::now();
+    let mut on_progress = move |_: &ParseState| {
+        if start.elapsed() >= PARSE_TIMEOUT {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let bytes = text.as_bytes();
+    let parsed = parser.parse_with_options(
+        &mut |i, _| bytes.get(i..).unwrap_or_default(),
+        old_tree.as_ref(),
+        Some(ParseOptions::new().progress_callback(&mut on_progress)),
+    );
     let tree = match parsed {
         Some(t) => t,
         None => {
@@ -638,13 +657,13 @@ fn collect_matches(
         if !m.satisfies_text_predicates(q, &mut b1, &mut b2, &mut provider) {
             continue;
         }
-        if !eval_general_predicates(q, m.pattern_index, m.captures, bytes) {
+        if !eval_general_predicates(q, m.pattern_index, m.captures(), bytes) {
             continue;
         }
         // group captures by capture index, preserving order
         let mut order: Vec<u32> = Vec::new();
         let mut groups: HashMap<u32, Vec<Node>> = HashMap::new();
-        for c in m.captures {
+        for c in m.captures() {
             let e = groups.entry(c.index).or_default();
             if e.is_empty() {
                 order.push(c.index);
